@@ -1,0 +1,53 @@
+name: Build GTA Vice City Port
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build AArch64 PortMaster package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build PortMaster package
+        run: |
+          docker build \
+            --file Containerfile \
+            --tag gtavc-portmaster-build \
+            .
+
+          container_id=$(docker create gtavc-portmaster-build)
+
+          docker cp \
+            "$container_id:/workspace/package/." \
+            "$GITHUB_WORKSPACE/package/"
+
+          docker rm "$container_id"
+
+      - name: Show package contents
+        run: |
+          echo "=== Package ==="
+          find package -type f -print
+
+      - name: Create archive
+        run: |
+          cd package
+          tar -czf ../gtavc-portmaster-aarch64.tar.gz .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gtavc-portmaster-aarch64
+          path: gtavc-portmaster-aarch64.tar.gz
+          if-no-files-found: error
