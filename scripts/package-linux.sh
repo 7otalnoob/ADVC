@@ -57,8 +57,10 @@ fi
 
 read -r manifest_count < "$ROOT_DIR/assetfile.txt"
 manifest_lines="$(wc -l < "$ROOT_DIR/assetfile.txt")"
-if [[ "$manifest_count" != 120 || "$manifest_lines" != 121 ]]; then
-    printf 'package: assetfile.txt must contain 120 entries (header plus 120 lines)\n' >&2
+manifest_body_lines="$((manifest_lines - 1))"
+if [[ "$manifest_count" != "$manifest_body_lines" ]]; then
+    printf 'package: assetfile.txt header count (%s) does not match its body (%s lines)\n' \
+        "$manifest_count" "$manifest_body_lines" >&2
     exit 1
 fi
 
