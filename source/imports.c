@@ -1,0 +1,1275 @@
+/* imports.c -- .so import resolution
+ *
+ * Copyright (C) 2021 fgsfds, Andy Nguyen
+ *
+ * This software may be modified and distributed under the terms
+ * of the MIT license.  See the LICENSE file for details.
+ *
+ * Serves both libGame.so and the vendored Android NDK C++ runtime.
+ * C++ runtime symbols (std::*, __cxa_*) resolve module-to-module from the donor,
+ * not here. The table takes priority during resolution (see so_resolve_symbol).
+ */
+
+#define _GNU_SOURCE // vasprintf and friends
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <string.h>
+#include <unistd.h>
+#include <assert.h>
+#include <errno.h>
+#include <wchar.h>
+#include <wctype.h>
+#include <ctype.h>
+#include <fcntl.h>
+#include <math.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <time.h>
+#include <dirent.h>
+#include <locale.h>
+#include <sys/time.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#include <SDL3/SDL_video.h>
+#include <AL/al.h>
+#include <AL/alc.h>
+#include <mpg123.h>
+
+
+#include "config.h"
+#include "so_util.h"
+#include "util.h"
+#include "libc_shim.h"
+#include "overlay.h"
+
+extern uintptr_t __cxa_atexit;
+
+extern uintptr_t __stack_chk_fail;
+
+static char *__ctype_;
+
+static int *errno_fake(void) {
+  return &errno;
+}
+
+static uint64_t __stack_chk_guard_fake = 0x4242424242424242;
+
+// Per-thread cache of the last successful eglMakeCurrent: the engine re-binds
+// the same context+surface many times per frame and mesa revalidates each time,
+// so skip the redundant bind (a no-op per the EGL spec). Keyed by TPIDR_EL0.
+#define MC_SLOTS 8
+static struct {
+  void *key;
+  EGLDisplay dpy; EGLSurface draw, read; EGLContext ctx;
+} g_mc[MC_SLOTS];
+
+static inline void *mc_thread_key(void) {
+  static _Thread_local int key;
+  return &key;
+}
+
+// ---------------------------------------------------------------------------
+// GL redundant-state cache. RenderWare / GTA SA re-set the same GL state (blend,
+// depth, cull, texture bindings, active unit, program, ...) many times per frame.
+// On the Switch mesa/nouveau driver every GL call is expensive and the game is
+// CPU-bound on call count (GPU mostly idle), so drop calls that don't change
+// state. Correct because the engine renders through one GL context at a time (EGL
+// make-current transfers ownership): glc_reset() runs on every REAL eglMakeCurrent
+// so the cache is never trusted across a context switch, and glDelete{Textures,
+// Program} invalidate the bind caches so a reused id is never wrongly skipped.
+// Set glc_enabled = 0 for a pure pass-through if a rendering glitch is suspected.
+// ---------------------------------------------------------------------------
+static int glc_enabled = 1;
+
+#define GLC_MAXCAPS 24
+static struct { GLenum cap; GLboolean on; } glc_caps[GLC_MAXCAPS];
+static int glc_ncaps;
+
+static struct {
+  int have_blend;  GLenum bsf, bdf;
+  int have_dfunc;  GLenum dfunc;
+  int have_dmask;  GLboolean dmask;
+  int have_cull;   GLenum cull;
+  int have_front;  GLenum front;
+  int have_cmask;  GLboolean cr, cg, cb, ca;
+  int have_active; GLenum active;
+  int have_prog;   GLuint prog;
+  GLuint tex2d[8]; int have_tex2d[8];
+} glc;
+
+// Invalidate the cache. Called on every real eglMakeCurrent (context ownership
+// transfer) and once per frame from eglSwapBuffers_cache (so the wrapper's own
+// direct GL -- movie player, FPS overlay -- can't leave the cache stale).
+static void gl_state_cache_reset(void) {
+  glc_ncaps = 0;
+  memset(&glc, 0, sizeof(glc));
+}
+
+static void glEnable_c(GLenum cap) {
+  if (glc_enabled) {
+    for (int i = 0; i < glc_ncaps; i++)
+      if (glc_caps[i].cap == cap) {
+        if (glc_caps[i].on) return;
+        glc_caps[i].on = GL_TRUE; glEnable(cap); return;
+      }
+    if (glc_ncaps < GLC_MAXCAPS) {
+      glc_caps[glc_ncaps].cap = cap; glc_caps[glc_ncaps].on = GL_TRUE; glc_ncaps++;
+    }
+  }
+  glEnable(cap);
+}
+static void glDisable_c(GLenum cap) {
+  if (glc_enabled) {
+    for (int i = 0; i < glc_ncaps; i++)
+      if (glc_caps[i].cap == cap) {
+        if (!glc_caps[i].on) return;
+        glc_caps[i].on = GL_FALSE; glDisable(cap); return;
+      }
+    if (glc_ncaps < GLC_MAXCAPS) {
+      glc_caps[glc_ncaps].cap = cap; glc_caps[glc_ncaps].on = GL_FALSE; glc_ncaps++;
+    }
+  }
+  glDisable(cap);
+}
+static void glBlendFunc_c(GLenum s, GLenum d) {
+  if (glc_enabled && glc.have_blend && glc.bsf == s && glc.bdf == d) return;
+  glc.have_blend = 1; glc.bsf = s; glc.bdf = d;
+  glBlendFunc(s, d);
+}
+static void glBlendFuncSeparate_c(GLenum sc, GLenum dc, GLenum sa, GLenum da) {
+  glc.have_blend = 0; // don't reconcile with the glBlendFunc cache
+  glBlendFuncSeparate(sc, dc, sa, da);
+}
+static void glDepthFunc_c(GLenum f) {
+  if (glc_enabled && glc.have_dfunc && glc.dfunc == f) return;
+  glc.have_dfunc = 1; glc.dfunc = f;
+  glDepthFunc(f);
+}
+static void glDepthMask_c(GLboolean m) {
+  if (glc_enabled && glc.have_dmask && glc.dmask == m) return;
+  glc.have_dmask = 1; glc.dmask = m;
+  glDepthMask(m);
+}
+static void glCullFace_c(GLenum m) {
+  if (glc_enabled && glc.have_cull && glc.cull == m) return;
+  glc.have_cull = 1; glc.cull = m;
+  glCullFace(m);
+}
+static void glFrontFace_c(GLenum m) {
+  if (glc_enabled && glc.have_front && glc.front == m) return;
+  glc.have_front = 1; glc.front = m;
+  glFrontFace(m);
+}
+static void glColorMask_c(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
+  if (glc_enabled && glc.have_cmask && glc.cr == r && glc.cg == g &&
+      glc.cb == b && glc.ca == a)
+    return;
+  glc.have_cmask = 1; glc.cr = r; glc.cg = g; glc.cb = b; glc.ca = a;
+  glColorMask(r, g, b, a);
+}
+static void glActiveTexture_c(GLenum unit) {
+  if (glc_enabled && glc.have_active && glc.active == unit) return;
+  glc.have_active = 1; glc.active = unit;
+  glActiveTexture(unit);
+}
+static void glBindTexture_c(GLenum target, GLuint tex) {
+  if (glc_enabled && target == GL_TEXTURE_2D && glc.have_active) {
+    unsigned idx = (unsigned)(glc.active - GL_TEXTURE0);
+    if (idx < 8) {
+      if (glc.have_tex2d[idx] && glc.tex2d[idx] == tex) return;
+      glc.have_tex2d[idx] = 1; glc.tex2d[idx] = tex;
+    }
+  }
+  glBindTexture(target, tex);
+}
+static void glUseProgram_c(GLuint p) {
+  if (glc_enabled && glc.have_prog && glc.prog == p) return;
+  glc.have_prog = 1; glc.prog = p;
+  glUseProgram(p);
+}
+static void glDeleteTextures_c(GLsizei n, const GLuint *t) {
+  memset(glc.have_tex2d, 0, sizeof(glc.have_tex2d)); // a deleted bound tex must
+  glDeleteTextures(n, t);                            // not be skipped when reused
+}
+static void glDeleteProgram_c(GLuint p) {
+  if (glc.have_prog && glc.prog == p) glc.have_prog = 0;
+  glDeleteProgram(p);
+}
+
+// Frame boundary: invalidate the state cache once per frame, then run the real
+// swap hook. The wrapper's own direct GL there (movie player / FPS overlay) goes
+// around the cache, so this keeps the game's next frame from trusting a stale
+// entry. Kept in this TU so no cross-file symbol is needed. eglSwapBuffersHook is
+// defined in movie_player.c (already referenced by the import table below).
+extern unsigned int eglSwapBuffersHook(void *display, void *surface);
+static SDL_Window *g_sdl_window;
+static SDL_GLContext g_sdl_context;
+
+void linux_set_sdl_context(SDL_Window *window, void *context) {
+  g_sdl_window = window;
+  g_sdl_context = context;
+}
+
+static unsigned int eglSwapBuffers_cache(void *display, void *surface) {
+  static unsigned long frames;
+  gl_state_cache_reset();
+  (void)display;
+  (void)surface;
+  SDL_GL_SwapWindow(g_sdl_window);
+  unsigned int result = EGL_TRUE;
+  if ((++frames % 60) == 0)
+    debugPrintf("EGL: presented frame %lu (result=%u)\n", frames, result);
+  return result;
+}
+
+static EGLDisplay eglGetDisplay_trace(EGLNativeDisplayType native) {
+  debugPrintf("EGL: eglGetDisplay(%p)\n", native);
+  EGLDisplay dpy;
+  if (native == EGL_DEFAULT_DISPLAY) {
+    // KMSDRM/GBM does not necessarily make EGL_DEFAULT_DISPLAY usable. SDL
+    // already opened and initialized the platform display for its GL context.
+    dpy = (EGLDisplay)(uintptr_t)1;
+    debugPrintf("EGL: using sentinel display for SDL-owned KMSDRM\n");
+  } else {
+    dpy = eglGetDisplay(native);
+  }
+  debugPrintf("EGL: eglGetDisplay -> %p\n", dpy);
+  return dpy;
+}
+
+static EGLBoolean eglInitialize_trace(EGLDisplay dpy, EGLint *major, EGLint *minor) {
+  debugPrintf("EGL: eglInitialize(%p)\n", dpy);
+  (void)dpy;
+  if (major) *major = 1;
+  if (minor) *minor = 5;
+  EGLBoolean ok = EGL_TRUE;
+  debugPrintf("EGL: eglInitialize -> sentinel success (%d.%d)\n", major ? *major : 0,
+              minor ? *minor : 0);
+  return ok;
+}
+
+static EGLBoolean eglChooseConfig_trace(EGLDisplay dpy, const EGLint *attrs,
+                                         EGLConfig *configs, EGLint size,
+                                         EGLint *count) {
+  debugPrintf("EGL: eglChooseConfig(%p, size=%d)\n", dpy, size);
+  (void)dpy;
+  (void)attrs;
+  if (count) *count = size > 0 ? 1 : 4;
+  if (configs && size > 0) configs[0] = (EGLConfig)(uintptr_t)1;
+  EGLBoolean ok = EGL_TRUE;
+  debugPrintf("EGL: eglChooseConfig -> %d (count=%d, err=0x%x)\n", ok,
+              count ? *count : 0, eglGetError());
+  return ok;
+}
+
+static EGLContext eglCreateContext_trace(EGLDisplay dpy, EGLConfig config,
+                                          EGLContext share, const EGLint *attrs) {
+  (void)dpy; (void)config; (void)share; (void)attrs;
+  debugPrintf("EGL: eglCreateContext -> sentinel\n");
+  return (EGLContext)(uintptr_t)1;
+}
+
+static EGLSurface eglCreateWindowSurface_trace(EGLDisplay dpy, EGLConfig config,
+                                                EGLNativeWindowType native,
+                                                const EGLint *attrs) {
+  (void)dpy; (void)config; (void)native; (void)attrs;
+  debugPrintf("EGL: eglCreateWindowSurface -> sentinel (window=%p)\n",
+              (void *)g_sdl_window);
+  return (EGLSurface)(uintptr_t)1;
+}
+
+static EGLBoolean eglMakeCurrent_dedup(EGLDisplay dpy, EGLSurface draw,
+                                       EGLSurface read, EGLContext ctx) {
+  (void)dpy; (void)read;
+  const SDL_GLContext target = (ctx == EGL_NO_CONTEXT || draw == EGL_NO_SURFACE)
+      ? NULL : g_sdl_context;
+  EGLBoolean ok = SDL_GL_MakeCurrent(g_sdl_window, target);
+  debugPrintf("EGL: eglMakeCurrent -> SDL_GL_MakeCurrent(%s, %d)\n",
+              target ? "acquire" : "release", ok);
+  if (ok)
+    gl_state_cache_reset();
+  return ok ? EGL_TRUE : EGL_FALSE;
+}
+
+// The world load creates thousands of buffers/textures without presenting, so
+// mesa never flushes; force a periodic submit to bound the nouveau bo-list.
+static void gl_load_drain(void) {
+  static unsigned n = 0;
+  if ((++n & 0x1ff) == 0) glFlush();
+}
+
+static void glTexImage2D_w(GLenum t, GLint l, GLint i, GLsizei w, GLsizei h,
+                           GLint b, GLenum f, GLenum y, const void *p) {
+  gl_load_drain();
+  glTexImage2D(t, l, i, w, h, b, f, y, p);
+}
+static void glCompressedTexImage2D_w(GLenum t, GLint l, GLenum i, GLsizei w,
+                                     GLsizei h, GLint b, GLsizei s, const void *d) {
+  gl_load_drain();
+  glCompressedTexImage2D(t, l, i, w, h, b, s, d);
+}
+static void glBufferData_w(GLenum target, GLsizeiptr size, const void *data,
+                           GLenum usage) {
+  gl_load_drain();
+  glBufferData(target, size, data, usage);
+}
+
+FILE *stderr_fake = (FILE *)&fake_sF[2];
+
+// OpenAL Soft spatial mixing with SDL3 playback.
+#include "audio_linux.h"
+
+void __assert2(const char *file, int line, const char *func, const char *expr) {
+  debugPrintf("assertion failed:\n%s:%d (%s): %s\n", file, line, func, expr);
+  assert(0);
+}
+
+// bionic's fatal logger: __android_log_assert(cond, tag, fmt, ...) -> log+abort
+void __android_log_assert(const char *cond, const char *tag, const char *fmt, ...) {
+  char string[0x400];
+  if (fmt) {
+    va_list va;
+    va_start(va, fmt);
+    vsnprintf(string, sizeof(string), fmt, va);
+    va_end(va);
+  } else {
+    snprintf(string, sizeof(string), "assertion \"%s\" failed", cond ? cond : "");
+  }
+  debugPrintf("FATAL %s: %s\n", tag ? tag : "", string);
+  abort();
+}
+
+int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
+#ifdef DEBUG_LOG
+  va_list list;
+  static char string[0x1000];
+
+  va_start(list, fmt);
+  vsnprintf(string, sizeof(string), fmt, list);
+  va_end(list);
+
+  debugPrintf("%s: %s\n", tag, string);
+#endif
+  return 0;
+}
+
+int __android_log_write(int prio, const char *tag, const char *text) {
+  debugPrintf("%s: %s\n", tag, text);
+  return 0;
+}
+
+int __android_log_vprint(int prio, const char *tag, const char *fmt, va_list va) {
+#ifdef DEBUG_LOG
+  static char string[0x1000];
+  vsnprintf(string, sizeof(string), fmt, va);
+  debugPrintf("%s: %s\n", tag, string);
+#endif
+  return 0;
+}
+
+// pthread stuff
+// have to wrap it since struct sizes are different
+
+int pthread_mutex_init_fake(pthread_mutex_t **uid, const int *mutexattr) {
+  pthread_mutex_t *m = calloc(1, sizeof(pthread_mutex_t));
+  if (!m) return -1;
+
+  // Force RECURSIVE on every engine mutex: mutexattr_settype is stubbed out, and
+  // the engine relies on recursive re-locking (else the world load self-deadlocks).
+  (void)mutexattr;
+  pthread_mutexattr_t attr;
+  if (pthread_mutexattr_init(&attr) != 0 ||
+      pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0 ||
+      pthread_mutex_init(m, &attr) != 0) {
+    pthread_mutexattr_destroy(&attr);
+    free(m);
+    return -1;
+  }
+  pthread_mutexattr_destroy(&attr);
+  *uid = m;
+  return 0;
+}
+
+int pthread_mutex_destroy_fake(pthread_mutex_t **uid) {
+  if (uid && *uid && (uintptr_t)*uid > 0x8000) {
+    pthread_mutex_destroy(*uid);
+    free(*uid);
+    *uid = NULL;
+  }
+  return 0;
+}
+
+int pthread_mutex_lock_fake(pthread_mutex_t **uid) {
+  int ret = 0;
+  if (!*uid) {
+    ret = pthread_mutex_init_fake(uid, NULL);
+  } else if ((uintptr_t)*uid == 0x4000) {
+    int attr = 1; // recursive
+    ret = pthread_mutex_init_fake(uid, &attr);
+  }
+  if (ret < 0) return ret;
+  return pthread_mutex_lock(*uid);
+}
+
+int pthread_mutex_trylock_fake(pthread_mutex_t **uid) {
+  int ret = 0;
+  if (!*uid) {
+    ret = pthread_mutex_init_fake(uid, NULL);
+  } else if ((uintptr_t)*uid == 0x4000) {
+    int attr = 1; // recursive
+    ret = pthread_mutex_init_fake(uid, &attr);
+  }
+  if (ret < 0) return ret;
+  return pthread_mutex_trylock(*uid);
+}
+
+int pthread_mutex_unlock_fake(pthread_mutex_t **uid) {
+  int ret = 0;
+  if (!*uid) {
+    ret = pthread_mutex_init_fake(uid, NULL);
+  } else if ((uintptr_t)*uid == 0x4000) {
+    int attr = 1; // recursive
+    ret = pthread_mutex_init_fake(uid, &attr);
+  }
+  if (ret < 0) return ret;
+  return pthread_mutex_unlock(*uid);
+}
+
+int pthread_cond_init_fake(pthread_cond_t **cnd, const int *condattr) {
+  pthread_cond_t *c = calloc(1, sizeof(pthread_cond_t));
+  if (!c) return -1;
+
+  int ret = pthread_cond_init(c, NULL);
+  if (ret < 0) {
+    free(c);
+    return -1;
+  }
+
+  *cnd = c;
+
+  return 0;
+}
+
+int pthread_cond_broadcast_fake(pthread_cond_t **cnd) {
+  if (!*cnd) {
+    if (pthread_cond_init_fake(cnd, NULL) < 0)
+      return -1;
+  }
+  return pthread_cond_broadcast(*cnd);
+}
+
+int pthread_cond_signal_fake(pthread_cond_t **cnd) {
+  if (!*cnd) {
+    if (pthread_cond_init_fake(cnd, NULL) < 0)
+      return -1;
+  };
+  return pthread_cond_signal(*cnd);
+}
+
+int pthread_cond_destroy_fake(pthread_cond_t **cnd) {
+  if (cnd && *cnd) {
+    pthread_cond_destroy(*cnd);
+    free(*cnd);
+    *cnd = NULL;
+  }
+  return 0;
+}
+
+int pthread_cond_wait_fake(pthread_cond_t **cnd, pthread_mutex_t **mtx) {
+  if (!*cnd) {
+    if (pthread_cond_init_fake(cnd, NULL) < 0)
+      return -1;
+  }
+  return pthread_cond_wait(*cnd, *mtx);
+}
+
+int pthread_cond_timedwait_fake(pthread_cond_t **cnd, pthread_mutex_t **mtx, const struct timespec *t) {
+  if (!*cnd) {
+    if (pthread_cond_init_fake(cnd, NULL) < 0)
+      return -1;
+  }
+  return pthread_cond_timedwait(*cnd, *mtx, t);
+}
+
+int pthread_once_fake(volatile int *once_control, void (*init_routine) (void)) {
+  if (!once_control || !init_routine)
+    return -1;
+  if (__sync_lock_test_and_set(once_control, 1) == 0)
+    (*init_routine)();
+  return 0;
+}
+
+typedef struct {
+  void *(*func)(void *);
+  void *arg;
+} PthreadStart;
+
+static void *pthread_trampoline(void *p) {
+  PthreadStart *s = p;
+  void *(*func)(void *) = s->func;
+  void *arg = s->arg;
+  free(s);
+  // OS_ThreadLaunch threads (audio/stream) share core 2 (logic=0, render=1)
+  set_thread_core(2);
+  thread_registry_add();            // track for freeze-on-exit
+  if (!game_tls_install())
+    return (void *)-1;
+  return func(arg);
+}
+
+int pthread_create_fake(pthread_t *thread, const void *unused, void *entry, void *arg) {
+  (void)unused;
+  PthreadStart *s = calloc(1, sizeof(*s));
+  if (!s)
+    return -1;
+  s->func = (void *(*)(void *))entry;
+  s->arg = arg;
+  int rc = pthread_create(thread, NULL, pthread_trampoline, s);
+  if (rc != 0)
+    free(s);
+  return rc;
+}
+
+// GL stuff
+
+void glGetShaderInfoLogHook(GLuint shader, GLsizei maxLength, GLsizei *length, GLchar *infoLog) {
+  glGetShaderInfoLog(shader, maxLength, length, infoLog);
+  debugPrintf("shader info log:\n%s\n", infoLog);
+}
+
+void glTexParameteriHook(GLenum target, GLenum param, GLint val) {
+  // force trilinear filtering instead of bilinear+nearest mipmap
+  if (val == GL_LINEAR_MIPMAP_NEAREST)
+    val = GL_LINEAR_MIPMAP_LINEAR;
+  glTexParameteri(target, param, val);
+}
+
+// CTW extras
+
+// fortify wrappers bionic emits for read()/write()
+ssize_t __read_chk(int fd, void *buf, size_t count, size_t buf_size) {
+  (void)buf_size;
+  return read(fd, buf, count);
+}
+
+ssize_t __write_chk(int fd, const void *buf, size_t count, size_t buf_size) {
+  (void)buf_size;
+  return write(fd, buf, count);
+}
+
+static int getpid_fake(void) {
+  return 1;
+}
+
+static int sched_yield_fake(void) {
+  sched_yield();
+  return 0;
+}
+
+static void sincos_fake(double x, double *s, double *c) {
+  *s = sin(x);
+  *c = cos(x);
+}
+
+// the donor's OpenSLES backend is dead here, but its imports must still resolve
+static void *SL_IID_fake = NULL;
+
+static unsigned int slCreateEngine_fake(void) {
+  return 0x0000000C; // SL_RESULT_FEATURE_UNSUPPORTED
+}
+
+// FuzzySeek (port of TheOfficialFloW's GTA_FuzzySeek / fastman92 JPatch): add
+// MPG123_FUZZY|SEEKBUFFER|GAPLESS when the game configures its mp3 decoder flags,
+// so mpg123 skips loading useless data on seeks -> less SD I/O and snappier radio
+// station switching. The game imports mpg123_param, so we just wrap it here (no
+// hook needed). Gated on the flags keys so non-flag param calls pass through
+// untouched.
+static int mpg123_param_fuzzy(mpg123_handle *mh, enum mpg123_parms type,
+                              long value, double fvalue) {
+  if (config.fuzzy_seek && (type == MPG123_FLAGS || type == MPG123_ADD_FLAGS))
+    value |= MPG123_FUZZY | MPG123_SEEKBUFFER | MPG123_GAPLESS;
+  return mpg123_param(mh, type, value, fvalue);
+}
+
+// import table
+
+DynLibFunction dynlib_functions[] = {
+  { "__sF", (uintptr_t)&fake_sF },
+  { "__cxa_atexit", (uintptr_t)&__cxa_atexit },
+  { "__cxa_finalize", (uintptr_t)&ret0 },
+  { "__cxa_thread_atexit_impl", (uintptr_t)&__cxa_thread_atexit_impl_fake },
+
+  { "stderr", (uintptr_t)&stderr_fake },
+
+  // AAssets are emulated over regular files relative to the game dir
+  { "AAssetManager_open", (uintptr_t)&AAssetManager_open_fake },
+  { "AAssetManager_fromJava", (uintptr_t)&AAssetManager_fromJava_fake },
+  { "AAsset_close", (uintptr_t)&AAsset_close_fake },
+  { "AAsset_getLength", (uintptr_t)&AAsset_getLength_fake },
+  { "AAsset_getLength64", (uintptr_t)&AAsset_getLength64_fake },
+  { "AAsset_getRemainingLength", (uintptr_t)&AAsset_getRemainingLength_fake },
+  { "AAsset_getRemainingLength64", (uintptr_t)&AAsset_getRemainingLength64_fake },
+  { "AAsset_read", (uintptr_t)&AAsset_read_fake },
+  { "AAsset_seek", (uintptr_t)&AAsset_seek_fake },
+  { "AAsset_seek64", (uintptr_t)&AAsset_seek64_fake },
+
+  // ANativeWindow maps onto the default NWindow
+  { "ANativeWindow_fromSurface", (uintptr_t)&ANativeWindow_fromSurface_fake },
+  { "ANativeWindow_getWidth", (uintptr_t)&ANativeWindow_getWidth_fake },
+  { "ANativeWindow_getHeight", (uintptr_t)&ANativeWindow_getHeight_fake },
+  { "ANativeWindow_release", (uintptr_t)&ANativeWindow_release_fake },
+  { "ANativeWindow_setBuffersGeometry", (uintptr_t)&ANativeWindow_setBuffersGeometry_fake },
+
+  // newlib pthread keys are functional, and libc++_shared needs them
+  // for emulated thread_local storage
+  { "pthread_key_create", (uintptr_t)&pthread_key_create },
+  { "pthread_key_delete", (uintptr_t)&pthread_key_delete },
+  { "pthread_getspecific", (uintptr_t)&pthread_getspecific },
+  { "pthread_setspecific", (uintptr_t)&pthread_setspecific },
+
+  { "pthread_cond_broadcast", (uintptr_t)&pthread_cond_broadcast_fake },
+  { "pthread_cond_destroy", (uintptr_t)&pthread_cond_destroy_fake },
+  { "pthread_cond_init", (uintptr_t)&pthread_cond_init_fake },
+  { "pthread_cond_signal", (uintptr_t)&pthread_cond_signal_fake },
+  { "pthread_cond_timedwait", (uintptr_t)&pthread_cond_timedwait_fake },
+  { "pthread_cond_wait", (uintptr_t)&pthread_cond_wait_fake },
+
+  { "pthread_create", (uintptr_t)&pthread_create_fake },
+  { "pthread_join", (uintptr_t)&pthread_join },
+  { "pthread_detach", (uintptr_t)&pthread_detach },
+  { "pthread_self", (uintptr_t)&pthread_self },
+
+  { "pthread_setschedparam", (uintptr_t)&ret0 },
+  { "pthread_setname_np", (uintptr_t)&ret0 },
+
+  { "pthread_attr_init", (uintptr_t)&ret0 },
+  { "pthread_attr_destroy", (uintptr_t)&ret0 },
+  { "pthread_attr_setschedparam", (uintptr_t)&ret0 },
+  { "pthread_attr_getschedparam", (uintptr_t)&pthread_attr_getschedparam_fake },
+  { "pthread_attr_getstacksize", (uintptr_t)&pthread_attr_getstacksize_fake },
+
+  { "pthread_mutexattr_init", (uintptr_t)&ret0 },
+  { "pthread_mutexattr_settype", (uintptr_t)&ret0 },
+  { "pthread_mutexattr_destroy", (uintptr_t)&ret0 },
+  { "pthread_mutex_destroy", (uintptr_t)&pthread_mutex_destroy_fake },
+  { "pthread_mutex_init", (uintptr_t)&pthread_mutex_init_fake },
+  { "pthread_mutex_lock", (uintptr_t)&pthread_mutex_lock_fake },
+  { "pthread_mutex_trylock", (uintptr_t)&pthread_mutex_trylock_fake },
+  { "pthread_mutex_unlock", (uintptr_t)&pthread_mutex_unlock_fake },
+
+  { "pthread_once", (uintptr_t)&pthread_once_fake },
+
+  { "pthread_rwlock_rdlock", (uintptr_t)&pthread_rwlock_rdlock_fake },
+  { "pthread_rwlock_wrlock", (uintptr_t)&pthread_rwlock_wrlock_fake },
+  { "pthread_rwlock_unlock", (uintptr_t)&pthread_rwlock_unlock_fake },
+
+  { "sem_init", (uintptr_t)&sem_init_fake },
+  { "sem_destroy", (uintptr_t)&sem_destroy_fake },
+  { "sem_post", (uintptr_t)&sem_post_fake },
+  { "sem_wait", (uintptr_t)&sem_wait_fake },
+  { "sem_trywait", (uintptr_t)&sem_trywait_fake },
+  { "sem_getvalue", (uintptr_t)&sem_getvalue_fake },
+
+  { "sched_get_priority_min", (uintptr_t)&retm1 },
+  { "sched_get_priority_max", (uintptr_t)&sched_get_priority_max_fake },
+
+  { "__android_log_print", (uintptr_t)__android_log_print },
+  { "__android_log_write", (uintptr_t)__android_log_write },
+  { "__android_log_vprint", (uintptr_t)__android_log_vprint },
+  { "android_set_abort_message", (uintptr_t)&android_set_abort_message_fake },
+
+  { "__errno", (uintptr_t)&errno_fake },
+
+  { "__stack_chk_fail", (uintptr_t)&__stack_chk_fail },
+  // freezes with real __stack_chk_guard
+  { "__stack_chk_guard", (uintptr_t)&__stack_chk_guard_fake },
+
+  { "_ctype_", (uintptr_t)&__ctype_ },
+  { "__ctype_get_mb_cur_max", (uintptr_t)&__ctype_get_mb_cur_max_fake },
+
+  { "__register_atfork", (uintptr_t)&__register_atfork_fake },
+  { "__system_property_get", (uintptr_t)&__system_property_get_fake },
+  { "getauxval", (uintptr_t)&getauxval_fake },
+  { "gettid", (uintptr_t)&gettid_fake },
+  { "syscall", (uintptr_t)&syscall_fake },
+  { "dl_iterate_phdr", (uintptr_t)&so_dl_iterate_phdr },
+
+  // fortify wrappers
+  { "__memcpy_chk", (uintptr_t)&__memcpy_chk_fake },
+  { "__memmove_chk", (uintptr_t)&__memmove_chk_fake },
+  { "__strcat_chk", (uintptr_t)&__strcat_chk_fake },
+  { "__strchr_chk", (uintptr_t)&__strchr_chk_fake },
+  { "__strcpy_chk", (uintptr_t)&__strcpy_chk_fake },
+  { "__strlen_chk", (uintptr_t)&__strlen_chk_fake },
+  { "__strncat_chk", (uintptr_t)&__strncat_chk_fake },
+  { "__strncpy_chk", (uintptr_t)&__strncpy_chk_fake },
+  { "__strncpy_chk2", (uintptr_t)&__strncpy_chk2_fake },
+  { "__vsnprintf_chk", (uintptr_t)&__vsnprintf_chk_fake },
+  { "__vsprintf_chk", (uintptr_t)&__vsprintf_chk_fake },
+
+  { "acos", (uintptr_t)&acos },
+  { "acosf", (uintptr_t)&acosf },
+  { "asinf", (uintptr_t)&asinf },
+  { "atan2f", (uintptr_t)&atan2f },
+  { "atanf", (uintptr_t)&atanf },
+  { "cos", (uintptr_t)&cos },
+  { "cosf", (uintptr_t)&cosf },
+  { "exp", (uintptr_t)&exp },
+  { "floor", (uintptr_t)&floor },
+  { "floorf", (uintptr_t)&floorf },
+  { "fmod", (uintptr_t)&fmod },
+  { "fmodf", (uintptr_t)&fmodf },
+  { "log", (uintptr_t)&log },
+  { "log10f", (uintptr_t)&log10f },
+  { "pow", (uintptr_t)&pow },
+  { "powf", (uintptr_t)&powf },
+  { "sin", (uintptr_t)&sin },
+  { "sinf", (uintptr_t)&sinf },
+  { "sincosf", (uintptr_t)&sincosf_fake },
+  { "tan", (uintptr_t)&tan },
+  { "tanf", (uintptr_t)&tanf },
+  { "sqrt", (uintptr_t)&sqrt },
+  { "sqrtf", (uintptr_t)&sqrtf },
+
+  { "atoi", (uintptr_t)&atoi },
+  { "atof", (uintptr_t)&atof },
+  { "isspace", (uintptr_t)&isspace },
+  { "tolower", (uintptr_t)&tolower },
+  { "towlower", (uintptr_t)&towlower },
+  { "toupper", (uintptr_t)&toupper },
+  { "towupper", (uintptr_t)&towupper },
+
+  { "calloc", (uintptr_t)&calloc },
+  { "free", (uintptr_t)&free },
+  { "malloc", (uintptr_t)&malloc },
+  { "realloc", (uintptr_t)&realloc },
+  { "posix_memalign", (uintptr_t)&posix_memalign_fake },
+
+  { "clock_gettime", (uintptr_t)&clock_gettime },
+  { "gettimeofday", (uintptr_t)&gettimeofday },
+  { "time", (uintptr_t)&time },
+  { "asctime", (uintptr_t)&asctime },
+  { "localtime", (uintptr_t)&localtime },
+  { "localtime_r", (uintptr_t)&localtime_r },
+  { "strftime", (uintptr_t)&strftime },
+  { "strftime_l", (uintptr_t)&strftime_l_fake },
+  { "nanosleep", (uintptr_t)&nanosleep },
+  { "usleep", (uintptr_t)&usleep },
+
+  // EGL: the game creates and manages its own context now
+  { "eglGetProcAddress", (uintptr_t)&eglGetProcAddress },
+  { "eglGetDisplay", (uintptr_t)&eglGetDisplay_trace },
+  { "eglQueryString", (uintptr_t)&eglQueryString },
+  { "eglInitialize", (uintptr_t)&eglInitialize_trace },
+  { "eglChooseConfig", (uintptr_t)&eglChooseConfig_trace },
+  { "eglGetConfigAttrib", (uintptr_t)&eglGetConfigAttrib },
+  { "eglCreateContext", (uintptr_t)&eglCreateContext_trace },
+  { "eglCreateWindowSurface", (uintptr_t)&eglCreateWindowSurface_trace },
+  { "eglDestroySurface", (uintptr_t)&eglDestroySurface },
+  { "eglDestroyContext", (uintptr_t)&eglDestroyContext },
+  { "eglMakeCurrent", (uintptr_t)&eglMakeCurrent_dedup },
+  // reset the GL cache after the overlay's direct GL, then run the (FPS) swap hook
+  { "eglSwapBuffers", (uintptr_t)&eglSwapBuffers_cache },
+  { "eglSwapInterval", (uintptr_t)&eglSwapInterval },
+  { "eglGetError", (uintptr_t)&eglGetError },
+  { "eglTerminate", (uintptr_t)&eglTerminate },
+  { "eglBindAPI", (uintptr_t)&eglBindAPI },
+
+  // OpenAL: imported by libGame.so since 2.x; alcOpenDevice/alcCreateContext
+  // go through hooks for the 44100hz override
+  { "alBufferData", (uintptr_t)&alBufferData },
+  { "alDeleteBuffers", (uintptr_t)&alDeleteBuffers },
+  { "alDeleteSources", (uintptr_t)&alDeleteSources },
+  { "alDistanceModel", (uintptr_t)&alDistanceModel },
+  { "alGenBuffers", (uintptr_t)&alGenBuffers },
+  { "alGenSources", (uintptr_t)&alGenSources },
+  { "alGetEnumValue", (uintptr_t)&alGetEnumValue },
+  { "alGetError", (uintptr_t)&alGetError },
+  { "alGetSourcef", (uintptr_t)&alGetSourcef },
+  { "alGetSourcei", (uintptr_t)&alGetSourcei },
+  { "alGetString", (uintptr_t)&alGetString },
+  { "alIsExtensionPresent", (uintptr_t)&alIsExtensionPresent },
+  { "alListener3f", (uintptr_t)&alListener3f },
+  { "alListenerf", (uintptr_t)&alListenerf },
+  { "alListenerfv", (uintptr_t)&alListenerfv },
+  { "alSource3f", (uintptr_t)&alSource3f },
+  { "alSourcePause", (uintptr_t)&alSourcePause },
+  { "alSourcePlay", (uintptr_t)&alSourcePlay },
+  { "alSourceQueueBuffers", (uintptr_t)&alSourceQueueBuffers },
+  { "alSourceStop", (uintptr_t)&alSourceStop },
+  { "alSourceUnqueueBuffers", (uintptr_t)&alSourceUnqueueBuffers },
+  { "alSourcef", (uintptr_t)&alSourcef },
+  { "alSourcei", (uintptr_t)&alSourcei },
+  { "alcCloseDevice", (uintptr_t)&alcCloseDeviceHook },
+  { "alcCreateContext", (uintptr_t)&alcCreateContextHook },
+  { "alcDestroyContext", (uintptr_t)&alcDestroyContext },
+  { "alcGetError", (uintptr_t)&alcGetError },
+  { "alcGetString", (uintptr_t)&alcGetString },
+  { "alcMakeContextCurrent", (uintptr_t)&alcMakeContextCurrent },
+  { "alcOpenDevice", (uintptr_t)&alcOpenDeviceHook },
+
+  // mpg123 (music streaming); was libVendor_mpg123.so on Android,
+  // provided natively by the switch-mpg123 portlib here
+  { "mpg123_delete", (uintptr_t)&mpg123_delete },
+  { "mpg123_exit", (uintptr_t)&mpg123_exit },
+  { "mpg123_feed", (uintptr_t)&mpg123_feed },
+  { "mpg123_feedseek", (uintptr_t)&mpg123_feedseek },
+  { "mpg123_format_all", (uintptr_t)&mpg123_format_all },
+  { "mpg123_getformat", (uintptr_t)&mpg123_getformat },
+  { "mpg123_info", (uintptr_t)&mpg123_info },
+  { "mpg123_init", (uintptr_t)&mpg123_init },
+  { "mpg123_new", (uintptr_t)&mpg123_new },
+  { "mpg123_open_feed", (uintptr_t)&mpg123_open_feed },
+  { "mpg123_outblock", (uintptr_t)&mpg123_outblock },
+  { "mpg123_read", (uintptr_t)&mpg123_read },
+
+  { "abort", (uintptr_t)&abort },
+  { "exit", (uintptr_t)&exit },
+
+  { "fopen", (uintptr_t)&fopen_fake },
+  { "fclose", (uintptr_t)&fclose_fake },
+  { "fdopen", (uintptr_t)&fdopen },
+  { "fflush", (uintptr_t)&fflush_fake },
+  { "fgetc", (uintptr_t)&fgetc },
+  { "fgets", (uintptr_t)&fgets },
+  { "fputs", (uintptr_t)&fputs_fake },
+  { "fputc", (uintptr_t)&fputc_fake },
+  { "fprintf", (uintptr_t)&fprintf_fake },
+  { "vfprintf", (uintptr_t)&vfprintf_fake },
+  { "fread", (uintptr_t)&fread_fake },
+  { "fseek", (uintptr_t)&fseek_fake },
+  { "fseeko", (uintptr_t)&fseeko },
+  { "ftell", (uintptr_t)&ftell },
+  { "ftello", (uintptr_t)&ftello },
+  { "fwrite", (uintptr_t)&fwrite_fake },
+  { "fstat", (uintptr_t)&fstat_fake },
+  { "ferror", (uintptr_t)&ferror_fake },
+  { "feof", (uintptr_t)&feof },
+  { "fileno", (uintptr_t)&fileno_fake },
+  { "ftruncate", (uintptr_t)&ftruncate },
+  { "setvbuf", (uintptr_t)&setvbuf },
+  { "setbuf", (uintptr_t)&setbuf_fake },
+  { "getc", (uintptr_t)&getc_fake },
+  { "ungetc", (uintptr_t)&ungetc_fake },
+  { "getwc", (uintptr_t)&getwc },
+  { "ungetwc", (uintptr_t)&ungetwc },
+  { "fputwc", (uintptr_t)&fputwc },
+
+  { "getenv", (uintptr_t)&getenv },
+
+  { "glActiveTexture", (uintptr_t)&glActiveTexture_c },
+  { "glAttachShader", (uintptr_t)&glAttachShader },
+  { "glBindAttribLocation", (uintptr_t)&glBindAttribLocation },
+  { "glBindBuffer", (uintptr_t)&glBindBuffer },
+  { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer },
+  { "glBindRenderbuffer", (uintptr_t)&glBindRenderbuffer },
+  { "glBindTexture", (uintptr_t)&glBindTexture_c },
+  { "glBlendFunc", (uintptr_t)&glBlendFunc_c },
+  { "glBlendFuncSeparate", (uintptr_t)&glBlendFuncSeparate_c },
+  { "glBufferData", (uintptr_t)&glBufferData_w },
+  { "glCheckFramebufferStatus", (uintptr_t)&glCheckFramebufferStatus },
+  { "glClear", (uintptr_t)&glClear },
+  { "glClearColor", (uintptr_t)&glClearColor },
+  { "glClearDepthf", (uintptr_t)&glClearDepthf },
+  { "glClearStencil", (uintptr_t)&glClearStencil },
+  { "glColorMask", (uintptr_t)&glColorMask_c },
+  { "glCompileShader", (uintptr_t)&glCompileShader },
+  { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D_w },
+  { "glCreateProgram", (uintptr_t)&glCreateProgram },
+  { "glCreateShader", (uintptr_t)&glCreateShader },
+  { "glCullFace", (uintptr_t)&glCullFace_c },
+  { "glDeleteBuffers", (uintptr_t)&glDeleteBuffers },
+  { "glDeleteFramebuffers", (uintptr_t)&glDeleteFramebuffers },
+  { "glDeleteProgram", (uintptr_t)&glDeleteProgram_c },
+  { "glDeleteRenderbuffers", (uintptr_t)&glDeleteRenderbuffers },
+  { "glDeleteShader", (uintptr_t)&glDeleteShader },
+  { "glDeleteTextures", (uintptr_t)&glDeleteTextures_c },
+  { "glDepthFunc", (uintptr_t)&glDepthFunc_c },
+  { "glDepthMask", (uintptr_t)&glDepthMask_c },
+  { "glDepthRangef", (uintptr_t)&glDepthRangef },
+  { "glDisable", (uintptr_t)&glDisable_c },
+  { "glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray },
+  { "glDrawArrays", (uintptr_t)&glDrawArrays },
+  { "glDrawElements", (uintptr_t)&glDrawElements },
+  { "glEnable", (uintptr_t)&glEnable_c },
+  { "glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray },
+  { "glFinish", (uintptr_t)&glFinish },
+  { "glFramebufferRenderbuffer", (uintptr_t)&glFramebufferRenderbuffer },
+  { "glFramebufferTexture2D", (uintptr_t)&glFramebufferTexture2D },
+  { "glFrontFace", (uintptr_t)&glFrontFace_c },
+  { "glGenBuffers", (uintptr_t)&glGenBuffers },
+  { "glGenFramebuffers", (uintptr_t)&glGenFramebuffers },
+  { "glGenRenderbuffers", (uintptr_t)&glGenRenderbuffers },
+  { "glGenTextures", (uintptr_t)&glGenTextures },
+  { "glGetAttribLocation", (uintptr_t)&glGetAttribLocation },
+  { "glGetError", (uintptr_t)&glGetError },
+  { "glGetBooleanv", (uintptr_t)&glGetBooleanv },
+  { "glGetIntegerv", (uintptr_t)&glGetIntegerv },
+  { "glGetProgramInfoLog", (uintptr_t)&glGetProgramInfoLog },
+  { "glGetProgramiv", (uintptr_t)&glGetProgramiv },
+  { "glGetShaderInfoLog", (uintptr_t)&glGetShaderInfoLogHook },
+  { "glGetShaderiv", (uintptr_t)&glGetShaderiv },
+  { "glGetString", (uintptr_t)&glGetString },
+  { "glGetUniformLocation", (uintptr_t)&glGetUniformLocation },
+  { "glHint", (uintptr_t)&glHint },
+  { "glIsEnabled", (uintptr_t)&glIsEnabled },
+  { "glIsTexture", (uintptr_t)&glIsTexture },
+  { "glLinkProgram", (uintptr_t)&glLinkProgram },
+  { "glPolygonOffset", (uintptr_t)&glPolygonOffset },
+  { "glReadPixels", (uintptr_t)&glReadPixels },
+  { "glRenderbufferStorage", (uintptr_t)&glRenderbufferStorage },
+  { "glScissor", (uintptr_t)&glScissor },
+  { "glShaderSource", (uintptr_t)&glShaderSource },
+  { "glTexImage2D", (uintptr_t)&glTexImage2D_w },
+  { "glTexParameterf", (uintptr_t)&glTexParameterf },
+  { "glTexParameteri", (uintptr_t)&glTexParameteri },
+  { "glUniform1f", (uintptr_t)&glUniform1f },
+  { "glUniform1fv", (uintptr_t)&glUniform1fv },
+  { "glUniform1i", (uintptr_t)&glUniform1i },
+  { "glUniform2fv", (uintptr_t)&glUniform2fv },
+  { "glUniform3f", (uintptr_t)&glUniform3f },
+  { "glUniform3fv", (uintptr_t)&glUniform3fv },
+  { "glUniform4fv", (uintptr_t)&glUniform4fv },
+  { "glUniformMatrix3fv", (uintptr_t)&glUniformMatrix3fv },
+  { "glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv },
+  { "glUseProgram", (uintptr_t)&glUseProgram_c },
+  { "glVertexAttrib4fv", (uintptr_t)&glVertexAttrib4fv },
+  { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
+  { "glViewport", (uintptr_t)&glViewport },
+
+  { "setjmp", (uintptr_t)&setjmp },
+  { "longjmp", (uintptr_t)&longjmp },
+
+  { "memcmp", (uintptr_t)&memcmp },
+  { "wmemcmp", (uintptr_t)&wmemcmp },
+  { "wmemchr", (uintptr_t)&wmemchr },
+  { "memcpy", (uintptr_t)&memcpy },
+  { "memmove", (uintptr_t)&memmove },
+  { "memset", (uintptr_t)&memset },
+  { "memchr", (uintptr_t)&memchr },
+
+  { "printf", (uintptr_t)&debugPrintf },
+
+  { "bsearch", (uintptr_t)&bsearch },
+  { "qsort", (uintptr_t)&qsort },
+
+  { "snprintf", (uintptr_t)&snprintf },
+  { "sprintf", (uintptr_t)&sprintf },
+  { "vsnprintf", (uintptr_t)&vsnprintf },
+  { "vsprintf", (uintptr_t)&vsprintf },
+  { "vasprintf", (uintptr_t)&vasprintf },
+
+  { "sscanf", (uintptr_t)&sscanf },
+  { "vsscanf", (uintptr_t)&vsscanf },
+  { "swprintf", (uintptr_t)&swprintf },
+
+  { "close", (uintptr_t)&close },
+  { "lseek", (uintptr_t)&lseek },
+  { "mkdir", (uintptr_t)&mkdir },
+  { "open", (uintptr_t)&open_fake },
+  { "openat", (uintptr_t)&openat_fake },
+  { "read", (uintptr_t)&read },
+  { "write", (uintptr_t)&write },
+  { "stat", (uintptr_t)&stat_fake },
+  { "lstat", (uintptr_t)&lstat_fake },
+  { "remove", (uintptr_t)&remove },
+  { "rename", (uintptr_t)&rename },
+  { "unlink", (uintptr_t)&unlink },
+  { "unlinkat", (uintptr_t)&unlinkat_fake },
+  { "truncate", (uintptr_t)&retm1 },
+  { "link", (uintptr_t)&retm1 },
+  { "symlink", (uintptr_t)&retm1 },
+  { "readlink", (uintptr_t)&retm1 },
+  { "chdir", (uintptr_t)&chdir },
+  { "getcwd", (uintptr_t)&getcwd },
+  { "realpath", (uintptr_t)&realpath_fake },
+  { "isatty", (uintptr_t)&isatty },
+  { "ioctl", (uintptr_t)&retm1 },
+  { "fchmod", (uintptr_t)&ret0 },
+  { "fchmodat", (uintptr_t)&ret0 },
+  { "utimensat", (uintptr_t)&ret0 },
+  { "sendfile", (uintptr_t)&retm1 },
+  { "statvfs", (uintptr_t)&statvfs_fake },
+  { "pathconf", (uintptr_t)&pathconf_fake },
+  { "sysconf", (uintptr_t)&sysconf_fake },
+
+  { "opendir", (uintptr_t)&opendir },
+  { "fdopendir", (uintptr_t)&ret0 },
+  { "closedir", (uintptr_t)&closedir },
+  { "readdir", (uintptr_t)&readdir_fake },
+  { "readdir64", (uintptr_t)&readdir_fake },
+
+  { "openlog", (uintptr_t)&ret0 },
+  { "closelog", (uintptr_t)&ret0 },
+  { "syslog", (uintptr_t)&ret0 },
+
+  { "strcasecmp", (uintptr_t)&strcasecmp },
+  { "strcat", (uintptr_t)&strcat },
+  { "strchr", (uintptr_t)&strchr },
+  { "strcmp", (uintptr_t)&strcmp },
+  { "strcoll", (uintptr_t)&strcoll },
+  { "strcoll_l", (uintptr_t)&strcoll_l_fake },
+  { "strcpy", (uintptr_t)&strcpy },
+  { "stpcpy", (uintptr_t)&stpcpy },
+  { "strdup", (uintptr_t)&strdup },
+  { "strerror", (uintptr_t)&strerror },
+  { "strerror_r", (uintptr_t)&strerror_r_fake },
+  { "strlen", (uintptr_t)&strlen },
+  { "strncasecmp", (uintptr_t)&strncasecmp },
+  { "strncat", (uintptr_t)&strncat },
+  { "strncmp", (uintptr_t)&strncmp },
+  { "strncpy", (uintptr_t)&strncpy },
+  { "strpbrk", (uintptr_t)&strpbrk },
+  { "strrchr", (uintptr_t)&strrchr },
+  { "strstr", (uintptr_t)&strstr },
+  { "strtod", (uintptr_t)&strtod },
+  { "strtok", (uintptr_t)&strtok },
+  { "strtol", (uintptr_t)&strtol },
+  { "strtoul", (uintptr_t)&strtoul },
+  { "strtof", (uintptr_t)&strtof },
+  { "strtold", (uintptr_t)&strtold },
+  { "strtold_l", (uintptr_t)&strtold_l_fake },
+  { "strtoll", (uintptr_t)&strtoll },
+  { "strtoll_l", (uintptr_t)&strtoll_l_fake },
+  { "strtoull", (uintptr_t)&strtoull },
+  { "strtoull_l", (uintptr_t)&strtoull_l_fake },
+  { "strxfrm", (uintptr_t)&strxfrm },
+  { "strxfrm_l", (uintptr_t)&strxfrm_l_fake },
+
+  { "srand", (uintptr_t)&srand },
+  { "rand", (uintptr_t)&rand },
+
+  // locale: the _l variants ignore the locale and use the C locale
+  { "setlocale", (uintptr_t)&setlocale },
+  { "localeconv", (uintptr_t)&localeconv },
+  { "newlocale", (uintptr_t)&newlocale_fake },
+  { "freelocale", (uintptr_t)&freelocale_fake },
+  { "uselocale", (uintptr_t)&uselocale_fake },
+  { "iswalpha_l", (uintptr_t)&iswalpha_l_fake },
+  { "iswblank_l", (uintptr_t)&iswblank_l_fake },
+  { "iswcntrl_l", (uintptr_t)&iswcntrl_l_fake },
+  { "iswdigit_l", (uintptr_t)&iswdigit_l_fake },
+  { "iswlower_l", (uintptr_t)&iswlower_l_fake },
+  { "iswprint_l", (uintptr_t)&iswprint_l_fake },
+  { "iswpunct_l", (uintptr_t)&iswpunct_l_fake },
+  { "iswspace_l", (uintptr_t)&iswspace_l_fake },
+  { "iswupper_l", (uintptr_t)&iswupper_l_fake },
+  { "iswxdigit_l", (uintptr_t)&iswxdigit_l_fake },
+  { "towlower_l", (uintptr_t)&towlower_l_fake },
+  { "towupper_l", (uintptr_t)&towupper_l_fake },
+  { "wcscoll_l", (uintptr_t)&wcscoll_l_fake },
+  { "wcsxfrm_l", (uintptr_t)&wcsxfrm_l_fake },
+
+  { "wctob", (uintptr_t)&wctob },
+  { "wctype", (uintptr_t)&wctype },
+  { "wcsxfrm", (uintptr_t)&wcsxfrm },
+  { "iswctype", (uintptr_t)&iswctype },
+  { "wcscoll", (uintptr_t)&wcscoll },
+  { "wcsftime", (uintptr_t)&wcsftime },
+  { "mbrtowc", (uintptr_t)&mbrtowc },
+  { "mbrlen", (uintptr_t)&mbrlen },
+  { "mbtowc", (uintptr_t)&mbtowc },
+  { "mbsrtowcs", (uintptr_t)&mbsrtowcs },
+  { "mbsnrtowcs", (uintptr_t)&mbsnrtowcs_fake },
+  { "wcsnrtombs", (uintptr_t)&wcsnrtombs_fake },
+  { "wcrtomb", (uintptr_t)&wcrtomb },
+  { "wcslen", (uintptr_t)&wcslen },
+  { "btowc", (uintptr_t)&btowc },
+  { "wcstod", (uintptr_t)&wcstod },
+  { "wcstof", (uintptr_t)&wcstof },
+  { "wcstol", (uintptr_t)&wcstol },
+  { "wcstold", (uintptr_t)&wcstold },
+  { "wcstoll", (uintptr_t)&wcstoll },
+  { "wcstoul", (uintptr_t)&wcstoul },
+  { "wcstoull", (uintptr_t)&wcstoull },
+
+  // --- CTW 4.4.243 additions ---
+
+  // libGame.so extras over the Max Payne 2.1.131 import set
+  { "__read_chk", (uintptr_t)&__read_chk },
+  { "__write_chk", (uintptr_t)&__write_chk },
+  { "atan", (uintptr_t)&atan },
+  { "expf", (uintptr_t)&expf },
+  { "frexp", (uintptr_t)&frexp },
+  { "logf", (uintptr_t)&logf },
+  { "modf", (uintptr_t)&modf },
+  { "gmtime", (uintptr_t)&gmtime },
+  { "getpid", (uintptr_t)&getpid_fake },
+  { "putchar", (uintptr_t)&putchar },
+  { "puts", (uintptr_t)&puts },
+  { "glBlendEquation", (uintptr_t)&glBlendEquation },
+  { "glLineWidth", (uintptr_t)&glLineWidth },
+  { "glUniform4f", (uintptr_t)&glUniform4f },
+  { "glVertexAttrib2f", (uintptr_t)&glVertexAttrib2f },
+  { "glVertexAttrib3f", (uintptr_t)&glVertexAttrib3f },
+  { "glVertexAttrib4f", (uintptr_t)&glVertexAttrib4f },
+  { "alBufferi", (uintptr_t)&alBufferi },
+  { "alcGetProcAddress", (uintptr_t)&alcGetProcAddress },
+  { "alcProcessContext", (uintptr_t)&alcProcessContext },
+  { "alcSuspendContext", (uintptr_t)&alcSuspendContext },
+  { "mpg123_param", (uintptr_t)&mpg123_param_fuzzy }, // FuzzySeek (see wrapper)
+
+  // imports of the C++ runtime donor (the APK's libopenal.so)
+  { "__assert2", (uintptr_t)&__assert2 },
+  { "__readlink_chk", (uintptr_t)&retm1 },
+  { "atan2", (uintptr_t)&atan2 },
+  { "cbrtf", (uintptr_t)&cbrtf },
+  { "exp2f", (uintptr_t)&exp2f },
+  { "hypot", (uintptr_t)&hypot },
+  { "ldexpf", (uintptr_t)&ldexpf },
+  { "log2f", (uintptr_t)&log2f },
+  { "sinh", (uintptr_t)&sinh },
+  { "sinhf", (uintptr_t)&sinhf },
+  { "sincos", (uintptr_t)&sincos_fake },
+  { "clearerr", (uintptr_t)&clearerr },
+  { "rewind", (uintptr_t)&rewind },
+  { "raise", (uintptr_t)&raise },
+  { "sched_yield", (uintptr_t)&sched_yield_fake },
+  { "slCreateEngine", (uintptr_t)&slCreateEngine_fake },
+  { "SL_IID_ANDROIDCONFIGURATION", (uintptr_t)&SL_IID_fake },
+  { "SL_IID_ANDROIDSIMPLEBUFFERQUEUE", (uintptr_t)&SL_IID_fake },
+  { "SL_IID_ENGINE", (uintptr_t)&SL_IID_fake },
+  { "SL_IID_PLAY", (uintptr_t)&SL_IID_fake },
+  { "SL_IID_RECORD", (uintptr_t)&SL_IID_fake },
+  // thread_local init wrapper; safe to no-op (TLS pointer is zero-initialized)
+  { "_ZTHN10ALCcontext13sLocalContextE", (uintptr_t)&ret0 },
+
+  // ======================================================================
+  // LCS 2.4.379 additions over the CTW import set
+  // (the older GTAJNIlib engine + its renderer/netcode pull in more symbols)
+  // ======================================================================
+
+  // -- GLESv2 functions the LCS renderer uses (native, -lGLESv2) --
+  { "glBlendColor", (uintptr_t)&glBlendColor },
+  { "glBlendEquationSeparate", (uintptr_t)&glBlendEquationSeparate },
+  { "glBufferSubData", (uintptr_t)&glBufferSubData },
+  { "glCompressedTexSubImage2D", (uintptr_t)&glCompressedTexSubImage2D },
+  { "glCopyTexImage2D", (uintptr_t)&glCopyTexImage2D },
+  { "glCopyTexSubImage2D", (uintptr_t)&glCopyTexSubImage2D },
+  { "glDetachShader", (uintptr_t)&glDetachShader },
+  { "glFlush", (uintptr_t)&glFlush },
+  { "glGenerateMipmap", (uintptr_t)&glGenerateMipmap },
+  { "glGetActiveAttrib", (uintptr_t)&glGetActiveAttrib },
+  { "glGetActiveUniform", (uintptr_t)&glGetActiveUniform },
+  { "glGetAttachedShaders", (uintptr_t)&glGetAttachedShaders },
+  { "glGetBufferParameteriv", (uintptr_t)&glGetBufferParameteriv },
+  { "glGetFloatv", (uintptr_t)&glGetFloatv },
+  { "glGetFramebufferAttachmentParameteriv", (uintptr_t)&glGetFramebufferAttachmentParameteriv },
+  { "glGetRenderbufferParameteriv", (uintptr_t)&glGetRenderbufferParameteriv },
+  { "glGetShaderPrecisionFormat", (uintptr_t)&glGetShaderPrecisionFormat },
+  { "glGetShaderSource", (uintptr_t)&glGetShaderSource },
+  { "glGetTexParameterfv", (uintptr_t)&glGetTexParameterfv },
+  { "glGetTexParameteriv", (uintptr_t)&glGetTexParameteriv },
+  { "glGetUniformfv", (uintptr_t)&glGetUniformfv },
+  { "glGetUniformiv", (uintptr_t)&glGetUniformiv },
+  { "glGetVertexAttribfv", (uintptr_t)&glGetVertexAttribfv },
+  { "glGetVertexAttribiv", (uintptr_t)&glGetVertexAttribiv },
+  { "glGetVertexAttribPointerv", (uintptr_t)&glGetVertexAttribPointerv },
+  { "glIsBuffer", (uintptr_t)&glIsBuffer },
+  { "glIsFramebuffer", (uintptr_t)&glIsFramebuffer },
+  { "glIsRenderbuffer", (uintptr_t)&glIsRenderbuffer },
+  { "glIsShader", (uintptr_t)&glIsShader },
+  { "glPixelStorei", (uintptr_t)&glPixelStorei },
+  { "glReleaseShaderCompiler", (uintptr_t)&glReleaseShaderCompiler },
+  { "glSampleCoverage", (uintptr_t)&glSampleCoverage },
+  { "glShaderBinary", (uintptr_t)&glShaderBinary },
+  { "glStencilFunc", (uintptr_t)&glStencilFunc },
+  { "glStencilFuncSeparate", (uintptr_t)&glStencilFuncSeparate },
+  { "glStencilMask", (uintptr_t)&glStencilMask },
+  { "glStencilMaskSeparate", (uintptr_t)&glStencilMaskSeparate },
+  { "glStencilOp", (uintptr_t)&glStencilOp },
+  { "glStencilOpSeparate", (uintptr_t)&glStencilOpSeparate },
+  { "glTexParameterfv", (uintptr_t)&glTexParameterfv },
+  { "glTexParameteriv", (uintptr_t)&glTexParameteriv },
+  { "glTexSubImage2D", (uintptr_t)&glTexSubImage2D },
+  { "glUniform1iv", (uintptr_t)&glUniform1iv },
+  { "glUniform2f", (uintptr_t)&glUniform2f },
+  { "glUniform2i", (uintptr_t)&glUniform2i },
+  { "glUniform2iv", (uintptr_t)&glUniform2iv },
+  { "glUniform3i", (uintptr_t)&glUniform3i },
+  { "glUniform3iv", (uintptr_t)&glUniform3iv },
+  { "glUniform4i", (uintptr_t)&glUniform4i },
+  { "glUniform4iv", (uintptr_t)&glUniform4iv },
+  { "glUniformMatrix2fv", (uintptr_t)&glUniformMatrix2fv },
+  { "glValidateProgram", (uintptr_t)&glValidateProgram },
+  { "glVertexAttrib1f", (uintptr_t)&glVertexAttrib1f },
+  { "glVertexAttrib1fv", (uintptr_t)&glVertexAttrib1fv },
+  { "glVertexAttrib2fv", (uintptr_t)&glVertexAttrib2fv },
+  { "glVertexAttrib3fv", (uintptr_t)&glVertexAttrib3fv },
+
+  // -- BSD sockets / net (Social Club + cloud). native via libnx -lnx;
+  //    socketInitializeDefault() is called once at boot in main.c --
+  { "socket", (uintptr_t)&socket },
+  { "bind", (uintptr_t)&bind },
+  { "connect", (uintptr_t)&connect },
+  { "accept", (uintptr_t)&accept },
+  { "listen", (uintptr_t)&listen },
+  { "recvfrom", (uintptr_t)&recvfrom },
+  { "sendto", (uintptr_t)&sendto },
+  { "setsockopt", (uintptr_t)&setsockopt_fake },
+  { "shutdown", (uintptr_t)&shutdown },
+  { "getaddrinfo", (uintptr_t)&getaddrinfo },
+  { "inet_pton", (uintptr_t)&inet_pton },
+  { "inet_ntop", (uintptr_t)&inet_ntop },
+  { "select", (uintptr_t)&select },
+  { "fcntl", (uintptr_t)&fcntl_fake },
+
+  // -- named POSIX semaphores (mapped to the same FakeSem as the unnamed ones) --
+  { "sem_open", (uintptr_t)&sem_open_fake },
+  { "sem_close", (uintptr_t)&sem_close_fake },
+  { "sem_unlink", (uintptr_t)&sem_unlink_fake },
+
+  // -- extra bionic _FORTIFY_SOURCE wrappers --
+  { "__memset_chk", (uintptr_t)&__memset_chk_fake },
+  { "__strrchr_chk", (uintptr_t)&__strrchr_chk_fake },
+  { "__fread_chk", (uintptr_t)&__fread_chk_fake },
+  { "__FD_SET_chk", (uintptr_t)&__FD_SET_chk_fake },
+  { "__FD_ISSET_chk", (uintptr_t)&__FD_ISSET_chk_fake },
+
+  // -- misc --
+  { "__android_log_assert", (uintptr_t)&__android_log_assert },
+  { "stdout", (uintptr_t)&fake_stdout },
+  { "mktime", (uintptr_t)&mktime },
+  { "pthread_attr_setdetachstate", (uintptr_t)&ret0 },
+  { "pthread_attr_setstacksize", (uintptr_t)&ret0 },
+
+  // -- C++ runtime donor imports not provided by libGame.so --
+  { "wmemcpy", (uintptr_t)&wmemcpy },
+  { "wmemset", (uintptr_t)&wmemset },
+  { "wmemmove", (uintptr_t)&wmemmove },
+  { "pthread_equal", (uintptr_t)&pthread_equal },
+  { "isdigit_l", (uintptr_t)&isdigit_l_fake },
+  { "isxdigit_l", (uintptr_t)&isxdigit_l_fake },
+  { "islower_l", (uintptr_t)&islower_l_fake },
+  { "isupper_l", (uintptr_t)&isupper_l_fake },
+  { "toupper_l", (uintptr_t)&toupper_l_fake },
+  { "tolower_l", (uintptr_t)&tolower_l_fake },
+
+  // ======================================================================
+  // GTA: Vice City 2.11.311 additions over the CTW/LCS import set.
+  // Everything else SA imports is either above or resolves from the C++ runtime
+  // donor (libc++_shared.so), so only these four are new here.
+  // ======================================================================
+  { "ctime", (uintptr_t)&ctime },
+  { "modff", (uintptr_t)&modff },
+  { "mpg123_length", (uintptr_t)&mpg123_length },
+  { "mpg123_set_filesize", (uintptr_t)&mpg123_set_filesize },
+};
+
+size_t dynlib_numfunctions = sizeof(dynlib_functions) / sizeof(*dynlib_functions);
+
+void update_imports(void) {
+  // only install the hook when the config option is enabled
+  if (config.trilinear_filter)
+    so_find_import(dynlib_functions, dynlib_numfunctions, "glTexParameteri")->func = (uintptr_t)glTexParameteriHook;
+}
