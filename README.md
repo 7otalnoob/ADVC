@@ -1,6 +1,6 @@
 <div align=center>
 
-<img src="extras/banner.png" alt="Banner" width="35%">
+
 
 </div>
 <h1 align=center>GTA: Vice City - generic Linux port</h1>
