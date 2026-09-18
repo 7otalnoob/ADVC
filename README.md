@@ -11,8 +11,8 @@ The Linux target is being aligned with the official **v2.12.259** `libGame.so`
 (arm64-v8a), matching the upstream Android payload. It runs the user's Android
 library natively in a minimal compatibility environment. Version-specific Switch
 gameplay patches are not applied by the Linux target. The host input regression
-suite covers v2.11.311's per-gamepad callback ABI and retains a fallback for the
-older v2.11.264 count-based ABI; AArch64 v2.11.311 target validation still
+suite covers vv2.12.259's per-gamepad callback ABI and retains a fallback for the
+older v2.11.264 count-based ABI; AArch64 v2.12.259 target validation still
 requires an ARM64 Play Store split.
 
 i made this because there's weird shady "PortMaster" archives going around [from the R36S wiki](https://r36swiki.com/wiki-gtavc.html),
@@ -38,10 +38,18 @@ ports/
     ├── libc++_shared.so
     ├── assetfile.txt
     ├── Adjustable.cfg
+    ├── anim/
+    ├── audio/
     ├── data/
     ├── models/
+    ├── rockstar/
+    ├── skins/
     ├── texdb/
-    └── audio/
+    ├── text/
+    ├── textures/
+    ├── txd/
+    ├── AVConfig.json
+    └── data1
 ```
 
 The launcher sources PortMaster's `control.txt`, imports its controller
