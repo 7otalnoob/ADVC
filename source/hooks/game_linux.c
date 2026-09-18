@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -91,6 +92,66 @@ void apply_look_sensitivity(void) {
     *g_look_sensitivity = config.look_sensitivity;
 }
 
+// --- one-shot HUD widget ID dump (debug only, temporary) --------------------
+// GTouchscreen is a global pointer to the Touchscreen singleton.
+// Touchscreen::GetHUDElementAt(float x, float y) resolves whatever widget
+// sits at a screen point; we CALL it (a real function call by symbol, not a
+// byte patch) for the centre of every widget rect already decoded from a
+// real gta_vc.set from this exact build, and log whatever ID the game
+// itself returns. Read-only: never writes anything, changes no behaviour.
+typedef struct { float x, y; } HudProbePoint;
+static const HudProbePoint g_hud_probe_points[] = {
+  {670.54f,283.25f},{600.87f,380.92f},{670.94f,331.42f},{660.94f,380.88f},
+  {683.76f,246.99f},{621.20f,331.98f},{6.67f,93.05f},{569.09f,329.69f},
+  {547.23f,377.30f},{6.31f,380.84f},{62.16f,380.84f},{670.54f,283.25f},
+  {600.87f,380.92f},{621.20f,331.98f},{660.94f,380.88f},{670.62f,331.98f},
+  {13.51f,142.46f},{683.76f,246.99f},{6.67f,93.05f},{63.04f,335.12f},
+  {16.43f,335.12f},{671.62f,6.27f},{6.03f,6.03f},{584.04f,6.27f},
+  {86.38f,6.43f},{252.32f,423.75f},{23.62f,131.30f},{-8.52f,170.68f},
+  {55.77f,170.68f},{683.82f,176.47f},{671.62f,5.62f},{671.62f,431.62f},
+  {670.54f,198.87f},{670.54f,283.25f},{660.94f,380.88f},{660.94f,380.88f},
+  {600.87f,380.92f},{609.91f,331.50f},{659.73f,330.90f},{659.09f,232.62f},
+  {660.98f,283.85f},{610.35f,282.64f},{288.88f,7.77f},
+};
+#define HUD_PROBE_COUNT (sizeof(g_hud_probe_points) / sizeof(g_hud_probe_points[0]))
+
+static void **g_touchscreen_slot; // address of the GTouchscreen global (a pointer var)
+static intptr_t (*GetHUDElementAt)(void *self, float x, float y);
+static int g_hud_probe_done;
+
+void dump_hud_widget_ids(void) {
+  if (g_hud_probe_done || !g_touchscreen_slot || !GetHUDElementAt)
+    return;
+  void *touchscreen = *g_touchscreen_slot;
+  if (!touchscreen)
+    return; // Touchscreen singleton not constructed yet; retry next frame
+
+  // Dedicated, always-on output file (independent of DEBUG_LOG, which is off
+  // by default): just launching the game once produces this file, no extra
+  // configuration needed.
+  FILE *f = fopen("hud_probe.log", "w");
+  if (f) {
+    fprintf(f, "GTouchscreen=%p, probing %zu points\n", touchscreen,
+            (size_t)HUD_PROBE_COUNT);
+  }
+  for (size_t i = 0; i < HUD_PROBE_COUNT; i++) {
+    intptr_t id = GetHUDElementAt(touchscreen, g_hud_probe_points[i].x,
+                                   g_hud_probe_points[i].y);
+    if (f)
+      fprintf(f, "record %2zu (x=%.2f y=%.2f) -> id=%ld (0x%lx)\n", i,
+              g_hud_probe_points[i].x, g_hud_probe_points[i].y, (long)id,
+              (unsigned long)id);
+    debugPrintf("hud-probe: record %2zu (x=%.2f y=%.2f) -> id=%ld (0x%lx)\n",
+                i, g_hud_probe_points[i].x, g_hud_probe_points[i].y,
+                (long)id, (unsigned long)id);
+  }
+  if (f) {
+    fflush(f);
+    fclose(f);
+  }
+  g_hud_probe_done = 1;
+}
+
 void patch_game(void) {
   /* Whole-function replacements only, no displaced-instruction trampolines.
    * These platform entry signatures are present in the target v2.11.311
@@ -113,6 +174,10 @@ void patch_game(void) {
       (void *)so_try_find_addr_rx(&game_mod, "_ZN14MobileSettings8settingsE");
   g_look_sensitivity =
       (float *)so_try_find_addr_rx(&game_mod, "_ZN12CMenuManager22m_PrefsLookSensitivityE");
+
+  g_touchscreen_slot = (void **)so_try_find_addr_rx(&game_mod, "GTouchscreen");
+  GetHUDElementAt = (intptr_t (*)(void *, float, float))
+      so_try_find_addr_rx(&game_mod, "_ZN11Touchscreen15GetHUDElementAtEff");
 
   debugPrintf("hooks: Linux platform only; version-sensitive gameplay offsets disabled\n");
 }
