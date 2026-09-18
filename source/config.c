@@ -53,9 +53,9 @@ int read_config(const char *file) {
   memset(&config, 0, sizeof(Config));
   config.screen_width = -1; // auto
   config.screen_height = -1;
-  config.trilinear_filter = 1;
+  config.trilinear_filter = 0;
   config.show_fps = 0; // small FPS counter in the top left corner
-  config.fps_cap_30 = 0;
+  config.fps_cap_30 = 1;
   config.auto_boot_delay = 3;
   config.ps2_corona_rotation = 1; // PS2 corona rotation on by default
   config.ps2_color_filter = 1;    // PS2 color filter on by default
@@ -66,7 +66,7 @@ int read_config(const char *file) {
   config.no_offscreen_despawn = 1;  // on by default (cars/peds stay off-screen)
   config.mobile_widgets = 0;        // off by default = hide the mobile touch widgets
   config.fuzzy_seek = 1;            // on by default (skip useless mpg123 data on seek)
-  config.look_sensitivity = 0.0f;   // <= 0 = don't touch the game's own value
+  config.look_sensitivity = 0.2f;   // <= 0 = don't touch the game's own value
 
   FILE *f = fopen(file, "r");
   if (f == NULL)

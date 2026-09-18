@@ -1,18 +1,18 @@
 <div align=center>
 
-
+<img src="extras/banner.png" alt="Banner" width="35%">
 
 </div>
 <h1 align=center>GTA: Vice City - generic Linux port</h1>
 
 This Linux/SDL3 port is based on the MIT-licensed
 [gtavc_nx](https://github.com/NaGaa95/gtavc_nx) Android ARM64 loader and shims.
-The Linux target is being aligned with the official **v2.12.259** `libGame.so`
+The Linux target is being aligned with the official **v2.11.311** `libGame.so`
 (arm64-v8a), matching the upstream Android payload. It runs the user's Android
 library natively in a minimal compatibility environment. Version-specific Switch
 gameplay patches are not applied by the Linux target. The host input regression
-suite covers vv2.12.259's per-gamepad callback ABI and retains a fallback for the
-older v2.12.259 count-based ABI; AArch64 v2.12.259 target validation still
+suite covers v2.11.311's per-gamepad callback ABI and retains a fallback for the
+older v2.11.264 count-based ABI; AArch64 v2.11.311 target validation still
 requires an ARM64 Play Store split.
 
 i made this because there's weird shady "PortMaster" archives going around [from the R36S wiki](https://r36swiki.com/wiki-gtavc.html),
@@ -38,18 +38,10 @@ ports/
     ├── libc++_shared.so
     ├── assetfile.txt
     ├── Adjustable.cfg
-    ├── anim/
-    ├── audio/
     ├── data/
     ├── models/
-    ├── rockstar/
-    ├── skins/
     ├── texdb/
-    ├── text/
-    ├── textures/
-    ├── txd/
-    ├── AVConfig.json
-    └── data1
+    └── audio/
 ```
 
 The launcher sources PortMaster's `control.txt`, imports its controller
