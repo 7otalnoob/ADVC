@@ -31,7 +31,6 @@ RUN chmod +x /workspace/scripts/portmaster-build.sh && \
     GAME_TITLE="$GAME_TITLE" \
     CONFIG_NAME="$CONFIG_NAME" \
     APPSTATE_NAME="$APPSTATE_NAME" \
-
     /workspace/scripts/portmaster-build.sh build
 
 FROM scratch AS artifact

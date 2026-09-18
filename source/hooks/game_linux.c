@@ -75,6 +75,22 @@ static int spawn_jni_thread(long *tid, const void *attr, const char *name,
 static int screen_get_width(void) { return screen_width; }
 static int screen_get_height(void) { return screen_height; }
 
+static void *mobile_settings_settings;
+void keep_game_frame_limiter_off(void) {
+  // MobileSettings::settings doesn't resolve on this VC build (symbol absent),
+  // so this stays a safe no-op until/unless a VC equivalent is found.
+  if (mobile_settings_settings)
+    *(int *)((uint8_t *)mobile_settings_settings + 1216) = 0;
+}
+
+static float *g_look_sensitivity;
+void apply_look_sensitivity(void) {
+  // CMenuManager::m_PrefsLookSensitivity: plain global float, confirmed
+  // present in this VC build. Direct data write, no hook, no offset.
+  if (config.look_sensitivity > 0.0f && g_look_sensitivity)
+    *g_look_sensitivity = config.look_sensitivity;
+}
+
 void patch_game(void) {
   /* Whole-function replacements only, no displaced-instruction trampolines.
    * These platform entry signatures are present in the target v2.11.311
@@ -92,5 +108,11 @@ void patch_game(void) {
   uintptr_t cloud_saves = so_try_find_addr_rx(&game_mod, "UseCloudSaves");
   if (cloud_saves)
     *(uint8_t *)cloud_saves = 0;
+
+  mobile_settings_settings =
+      (void *)so_try_find_addr_rx(&game_mod, "_ZN14MobileSettings8settingsE");
+  g_look_sensitivity =
+      (float *)so_try_find_addr_rx(&game_mod, "_ZN12CMenuManager22m_PrefsLookSensitivityE");
+
   debugPrintf("hooks: Linux platform only; version-sensitive gameplay offsets disabled\n");
 }
