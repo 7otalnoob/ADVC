@@ -7,7 +7,7 @@
 
 This Linux/SDL3 port is based on the MIT-licensed
 [gtavc_nx](https://github.com/NaGaa95/gtavc_nx) Android ARM64 loader and shims.
-The Linux target is being aligned with the official **v2.11.311** `libGame.so`
+The Linux target is being aligned with the official **v2.12.259** `libGame.so`
 (arm64-v8a), matching the upstream Android payload. It runs the user's Android
 library natively in a minimal compatibility environment. Version-specific Switch
 gameplay patches are not applied by the Linux target. The host input regression
