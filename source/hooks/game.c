@@ -168,6 +168,15 @@ void keep_game_frame_limiter_off(void) {
     *(int *)((uint8_t *)MobileSettings_settings + 1216) = 0;
 }
 
+// CMenuManager::m_PrefsLookSensitivity is a plain global float (a data symbol,
+// not a function) -- no offset guessing, no hook, just a direct write. Safe by
+// construction: worst case is a value that feels wrong, not a crash.
+static float *g_look_sensitivity;
+void apply_look_sensitivity(void) {
+  if (config.look_sensitivity > 0.0f && g_look_sensitivity)
+    *g_look_sensitivity = config.look_sensitivity;
+}
+
 // Called from free_aim_stub.s when a lock-on target exists but isn't being cycled.
 __attribute__((visibility("hidden"))) void free_aim_maybe(void *playerPed) {
   static int prev = 0;
@@ -968,6 +977,8 @@ void patch_game(void) {
   CHID__GetInputType = (void *)chid_getinputtype; // resolved above
   MobileSettings_settings =
       (void *)so_try_find_addr_rx(&game_mod, "_ZN14MobileSettings8settingsE");
+  g_look_sensitivity =
+      (float *)so_try_find_addr_rx(&game_mod, "_ZN12CMenuManager22m_PrefsLookSensitivityE");
   if (so_try_find_addr_rx(&game_mod, "_ZN14MobileSettings13IsFreeAimModeEv"))
     hook_arm64(so_find_addr(&game_mod, "_ZN14MobileSettings13IsFreeAimModeEv"),
                (uintptr_t)MobileSettings__IsFreeAimMode);

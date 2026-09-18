@@ -61,6 +61,11 @@ typedef struct {
                              // and the 3 touch rows in the controls menu)
   int fuzzy_seek;            // 1 (default) = OR MPG123_FUZZY|SEEKBUFFER|GAPLESS into
                              // mpg123 flag calls (TheOfficialFloW's FuzzySeek port)
+  float look_sensitivity;    // overrides CMenuManager::m_PrefsLookSensitivity every
+                             // frame. <= 0 (default) = leave the game's own value
+                             // alone. VC's mobile default feels very fast on a full
+                             // analog stick (it was tuned for small touch swipes);
+                             // try something like 0.3-0.6 and adjust to taste.
 } Config;
 
 extern Config config;

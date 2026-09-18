@@ -285,6 +285,9 @@ int main(void) {
     if ((frames % 60) == 0)
       debugPrintf("main: implOnDrawFrame begin (%lu)\n", frames);
     ((void (*)(void *, void *, float))implOnDrawFrame)(fake_env, NULL, dt);
+    if (config.fps_cap_30)
+      keep_game_frame_limiter_off();
+    apply_look_sensitivity();
     if ((frames % 60) == 0)
       debugPrintf("main: implOnDrawFrame returned (%lu)\n", frames);
     frames++;

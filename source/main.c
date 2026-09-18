@@ -588,6 +588,7 @@ int main(void) {
     implOnDrawFrame(fake_env, NULL, dt);
     if (config.fps_cap_30)
       keep_game_frame_limiter_off();
+    apply_look_sensitivity();
 
     if (boot_frames < 10) {
       if (++boot_frames == 10)

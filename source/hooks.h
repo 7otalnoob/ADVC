@@ -5,6 +5,10 @@ void patch_game(void);
 
 void keep_game_frame_limiter_off(void);
 
+// Direct write to CMenuManager::m_PrefsLookSensitivity (see config.look_sensitivity).
+// Safe: plain data symbol, no hook, no offset guessing.
+void apply_look_sensitivity(void);
+
 // Terminate the process, skipping the mobile engine's crashy teardown (see main.c).
 // Commits the SD first so any just-written save persists. Never returns.
 void hard_exit(void);

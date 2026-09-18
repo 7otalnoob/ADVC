@@ -28,7 +28,8 @@
   CONFIG_VAR_INT(disable_ped_spec); \
   CONFIG_VAR_INT(no_offscreen_despawn); \
   CONFIG_VAR_INT(mobile_widgets); \
-  CONFIG_VAR_INT(fuzzy_seek);
+  CONFIG_VAR_INT(fuzzy_seek); \
+  CONFIG_VAR_FLOAT(look_sensitivity);
 
 Config config;
 
@@ -65,6 +66,7 @@ int read_config(const char *file) {
   config.no_offscreen_despawn = 1;  // on by default (cars/peds stay off-screen)
   config.mobile_widgets = 0;        // off by default = hide the mobile touch widgets
   config.fuzzy_seek = 1;            // on by default (skip useless mpg123 data on seek)
+  config.look_sensitivity = 0.0f;   // <= 0 = don't touch the game's own value
 
   FILE *f = fopen(file, "r");
   if (f == NULL)
