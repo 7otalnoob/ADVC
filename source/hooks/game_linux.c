@@ -117,39 +117,55 @@ static const HudProbePoint g_hud_probe_points[] = {
 
 static void **g_touchscreen_slot; // address of the GTouchscreen global (a pointer var)
 static intptr_t (*GetHUDElementAt)(void *self, float x, float y);
-static int g_hud_probe_done;
+static intptr_t g_hud_last_id[HUD_PROBE_COUNT]; // -1 = never probed yet
+static int g_hud_probe_pass;
+static unsigned g_hud_probe_frame_count;
 
 void dump_hud_widget_ids(void) {
-  if (g_hud_probe_done || !g_touchscreen_slot || !GetHUDElementAt)
+  if (!g_touchscreen_slot || !GetHUDElementAt)
     return;
   void *touchscreen = *g_touchscreen_slot;
   if (!touchscreen)
-    return; // Touchscreen singleton not constructed yet; retry next frame
+    return; // Touchscreen singleton not constructed yet; retry later
 
-  // Dedicated, always-on output file (independent of DEBUG_LOG, which is off
-  // by default): just launching the game once produces this file, no extra
-  // configuration needed.
-  FILE *f = fopen("hud_probe.log", "w");
-  if (f) {
-    fprintf(f, "GTouchscreen=%p, probing %zu points\n", touchscreen,
-            (size_t)HUD_PROBE_COUNT);
+  // Re-probe roughly every 3 seconds (assuming ~60 fps) for as long as the
+  // game runs, so playing normally for a bit -- getting in a car, taking out
+  // a weapon, etc. -- surfaces widgets that are only "hit-testable" in that
+  // context. Only ever WRITES a line when a point's answer changes, so the
+  // log stays small; nothing is overwritten, everything accumulates.
+  if (g_hud_probe_frame_count++ % 180 != 0)
+    return;
+  int pass = ++g_hud_probe_pass;
+  if (pass == 1) {
+    for (size_t i = 0; i < HUD_PROBE_COUNT; i++)
+      g_hud_last_id[i] = -1; // force the first pass to log every point once
   }
+
+  FILE *f = fopen("hud_probe.log", "a"); // append: keeps every session's history
+  if (f && pass == 1)
+    fprintf(f, "--- new run, GTouchscreen=%p, %zu points, probing every ~3s ---\n",
+            touchscreen, (size_t)HUD_PROBE_COUNT);
+
   for (size_t i = 0; i < HUD_PROBE_COUNT; i++) {
     intptr_t id = GetHUDElementAt(touchscreen, g_hud_probe_points[i].x,
                                    g_hud_probe_points[i].y);
+    if (id == g_hud_last_id[i])
+      continue; // nothing new to report for this point
     if (f)
-      fprintf(f, "record %2zu (x=%.2f y=%.2f) -> id=%ld (0x%lx)\n", i,
-              g_hud_probe_points[i].x, g_hud_probe_points[i].y, (long)id,
-              (unsigned long)id);
-    debugPrintf("hud-probe: record %2zu (x=%.2f y=%.2f) -> id=%ld (0x%lx)\n",
-                i, g_hud_probe_points[i].x, g_hud_probe_points[i].y,
-                (long)id, (unsigned long)id);
+      fprintf(f,
+              "pass %3d: record %2zu (x=%.2f y=%.2f) id %ld -> %ld (0x%lx)\n",
+              pass, i, g_hud_probe_points[i].x, g_hud_probe_points[i].y,
+              (long)g_hud_last_id[i], (long)id, (unsigned long)id);
+    debugPrintf(
+        "hud-probe: pass %3d record %2zu (x=%.2f y=%.2f) id %ld -> %ld (0x%lx)\n",
+        pass, i, g_hud_probe_points[i].x, g_hud_probe_points[i].y,
+        (long)g_hud_last_id[i], (long)id, (unsigned long)id);
+    g_hud_last_id[i] = id;
   }
   if (f) {
     fflush(f);
     fclose(f);
   }
-  g_hud_probe_done = 1;
 }
 
 void patch_game(void) {
