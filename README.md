@@ -12,7 +12,7 @@ The Linux target is being aligned with the official **v2.12.259** `libGame.so`
 library natively in a minimal compatibility environment. Version-specific Switch
 gameplay patches are not applied by the Linux target. The host input regression
 suite covers vv2.12.259's per-gamepad callback ABI and retains a fallback for the
-older v2.11.264 count-based ABI; AArch64 v2.12.259 target validation still
+older v2.12.259 count-based ABI; AArch64 v2.12.259 target validation still
 requires an ARM64 Play Store split.
 
 i made this because there's weird shady "PortMaster" archives going around [from the R36S wiki](https://r36swiki.com/wiki-gtavc.html),
