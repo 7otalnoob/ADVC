@@ -200,12 +200,16 @@ static void run_hud_id_test(void *touchscreen) {
   g_hud_id_test_done = 1;
 }
 
+static void apply_adjustable_cfg(void *touchscreen); // defined below
+
 void dump_hud_widget_ids(void) {
   if (!g_touchscreen_slot || !GetHUDElementAt)
     return;
   void *touchscreen = *g_touchscreen_slot;
   if (!touchscreen)
     return; // Touchscreen singleton not constructed yet; retry later
+
+  apply_adjustable_cfg(touchscreen);
 
   if (config.hud_restore_defaults && !g_hud_restore_done && RestoreDefaultsFn) {
     RestoreDefaultsFn(touchscreen);
@@ -257,6 +261,80 @@ void dump_hud_widget_ids(void) {
   if (f) {
     fflush(f);
     fclose(f);
+  }
+}
+
+// --- real feature: Adjustable.cfg -------------------------------------
+// Plain text, one widget per line: "name x y resize_taps". Lines starting
+// with '#' and blank lines are ignored. Unknown names are ignored (logged
+// to hud_probe.log so a typo doesn't fail silently). resize_taps is how
+// many times to call Touchscreen::ResizeButton for that widget (0 = leave
+// its size alone -- we don't yet know if ResizeButton takes an absolute
+// size or cycles presets, so this is deliberately coarse for now).
+// Applied once, at boot, after Touchscreen exists.
+typedef struct { const char *name; int id; } HudWidgetName;
+static const HudWidgetName g_hud_widget_names[] = {
+  {"radar", 22}, {"notifications", 23}, {"info_panel", 24},
+};
+#define HUD_WIDGET_NAME_COUNT \
+  (sizeof(g_hud_widget_names) / sizeof(g_hud_widget_names[0]))
+
+static int g_adjustable_cfg_done;
+
+static void apply_adjustable_cfg(void *touchscreen) {
+  if (g_adjustable_cfg_done)
+    return;
+  g_adjustable_cfg_done = 1; // only ever try once, whether the file exists or not
+
+  FILE *cfg = fopen("Adjustable.cfg", "r");
+  if (!cfg)
+    return; // no file = nothing to apply, not an error
+
+  FILE *log = fopen("hud_probe.log", "a");
+  if (log)
+    fprintf(log, "--- Adjustable.cfg found, applying ---\n");
+
+  char line[256];
+  while (fgets(line, sizeof(line), cfg)) {
+    char name[64];
+    float x, y;
+    int taps = 0;
+    char *p = line;
+    while (*p == ' ' || *p == '\t')
+      p++;
+    if (*p == '#' || *p == '\n' || *p == '\0')
+      continue;
+    int matched = sscanf(p, "%63s %f %f %d", name, &x, &y, &taps);
+    if (matched < 3) {
+      if (log)
+        fprintf(log, "Adjustable.cfg: skipping unparseable line: %s", line);
+      continue;
+    }
+    int id = -1;
+    for (size_t i = 0; i < HUD_WIDGET_NAME_COUNT; i++) {
+      if (strcmp(g_hud_widget_names[i].name, name) == 0) {
+        id = g_hud_widget_names[i].id;
+        break;
+      }
+    }
+    if (id < 0) {
+      if (log)
+        fprintf(log, "Adjustable.cfg: unknown widget name '%s', skipping\n", name);
+      continue;
+    }
+    if (MoveButton)
+      MoveButton(touchscreen, id, x, y);
+    for (int t = 0; t < taps; t++)
+      if (ResizeButtonFn)
+        ResizeButtonFn(touchscreen, id);
+    if (log)
+      fprintf(log, "Adjustable.cfg: %s (id %d) -> (%.1f,%.1f), resized x%d\n",
+              name, id, x, y, taps);
+  }
+  fclose(cfg);
+  if (log) {
+    fflush(log);
+    fclose(log);
   }
 }
 
