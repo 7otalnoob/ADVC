@@ -48,13 +48,7 @@ static void send_button(int pad, int button, bool down) {
   (down ? button_down : button_up)(fake_env, NULL, pad, button);
   if (trace) fprintf(stderr, "input: pad=%d button=%d %s\n",
                      pad, button, down ? "down" : "up");
-  if (button == 5 && down) { // SDL_GAMEPAD_BUTTON_BACK, see `buttons[]` above
-    FILE *f = fopen("select_probe.log", "a");
-    if (f) {
-      fprintf(f, "Select/Back reached input_linux.c: pad=%d button=%d\n", pad, button);
-      fclose(f);
-    }
-  }
+
 }
 
 static void check_quit_chord(int pad) {

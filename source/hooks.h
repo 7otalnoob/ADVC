@@ -9,11 +9,6 @@ void keep_game_frame_limiter_off(void);
 // Safe: plain data symbol, no hook, no offset guessing.
 void apply_look_sensitivity(void);
 
-// Applies Adjustable.cfg (Touchscreen widget positions) once, at boot.
-// See game_linux.c. Safe to call every frame: no-ops once done or if
-// Touchscreen isn't ready yet.
-void apply_adjustable_cfg(void);
-
 // Terminate the process, skipping the mobile engine's crashy teardown (see main.c).
 // Commits the SD first so any just-written save persists. Never returns.
 void hard_exit(void);

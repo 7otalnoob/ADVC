@@ -12,7 +12,6 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -92,86 +91,6 @@ void apply_look_sensitivity(void) {
     *g_look_sensitivity = config.look_sensitivity;
 }
 
-// --- real feature: Adjustable.cfg -------------------------------------
-// GTouchscreen is a global pointer to the Touchscreen singleton.
-// Touchscreen::MoveButton(int id, float x, float y) and
-// Touchscreen::ResizeButton(int id) are real functions in this VC build,
-// called by symbol (no byte patching, no offset guessing). The three ids
-// below were confirmed by live on-device testing (GetHUDElementAt probing
-// + visually watching each one move):
-//   22 = radar/map (top-left)
-//   23 = notification/call banner (top-right)
-//   24 = small info panel next to the radar (top-left)
-// Plain text, one widget per line: "name x y resize_taps". Lines starting
-// with '#' and blank lines are ignored. Unparseable lines and unknown
-// names are silently skipped. resize_taps is how
-// many times to call ResizeButton for that widget (0 = leave its size
-// alone -- we don't yet know if ResizeButton takes an absolute size or
-// cycles presets). Applied once, at boot, after Touchscreen exists.
-static void **g_touchscreen_slot; // address of the GTouchscreen global (a pointer var)
-static void (*MoveButton)(void *self, int id, float x, float y);
-static void (*ResizeButtonFn)(void *self, int id);
-
-typedef struct { const char *name; int id; } HudWidgetName;
-static const HudWidgetName g_hud_widget_names[] = {
-  {"radar", 22}, {"notifications", 23}, {"info_panel", 24},
-};
-#define HUD_WIDGET_NAME_COUNT \
-  (sizeof(g_hud_widget_names) / sizeof(g_hud_widget_names[0]))
-
-static int g_adjustable_cfg_done;
-static unsigned g_adjustable_cfg_ready_frames;
-
-void apply_adjustable_cfg(void) {
-  if (g_adjustable_cfg_done || !g_touchscreen_slot)
-    return;
-  void *touchscreen = *g_touchscreen_slot;
-  if (!touchscreen)
-    return; // Touchscreen singleton not constructed yet; retry next frame
-
-  // Give the game a couple of seconds after GTouchscreen first appears to
-  // finish constructing EVERY widget slot, not just the first one -- moving
-  // a not-yet-built widget silently does nothing, which looked like "only
-  // the radar moves" even though the ids themselves are correct.
-  if (g_adjustable_cfg_ready_frames++ < 120)
-    return;
-  g_adjustable_cfg_done = 1; // only ever try once, whether the file exists or not
-
-  FILE *cfg = fopen("Adjustable.cfg", "r");
-  if (!cfg)
-    return; // no file = nothing to apply, not an error
-
-  char line[256];
-  while (fgets(line, sizeof(line), cfg)) {
-    char name[64];
-    float x, y;
-    int taps = 0;
-    char *p = line;
-    while (*p == ' ' || *p == '\t')
-      p++;
-    if (*p == '#' || *p == '\n' || *p == 0)
-      continue;
-    int matched = sscanf(p, "%63s %f %f %d", name, &x, &y, &taps);
-    if (matched < 3)
-      continue;
-    int id = -1;
-    for (size_t i = 0; i < HUD_WIDGET_NAME_COUNT; i++) {
-      if (strcmp(g_hud_widget_names[i].name, name) == 0) {
-        id = g_hud_widget_names[i].id;
-        break;
-      }
-    }
-    if (id < 0)
-      continue;
-    if (MoveButton)
-      MoveButton(touchscreen, id, x, y);
-    for (int t = 0; t < taps; t++)
-      if (ResizeButtonFn)
-        ResizeButtonFn(touchscreen, id);
-  }
-  fclose(cfg);
-}
-
 void patch_game(void) {
   /* Whole-function replacements only, no displaced-instruction trampolines.
    * These platform entry signatures are present in the target v2.11.311
@@ -194,12 +113,6 @@ void patch_game(void) {
       (void *)so_try_find_addr_rx(&game_mod, "_ZN14MobileSettings8settingsE");
   g_look_sensitivity =
       (float *)so_try_find_addr_rx(&game_mod, "_ZN12CMenuManager22m_PrefsLookSensitivityE");
-
-  g_touchscreen_slot = (void **)so_try_find_addr_rx(&game_mod, "GTouchscreen");
-  MoveButton = (void (*)(void *, int, float, float))
-      so_try_find_addr_rx(&game_mod, "_ZN11Touchscreen10MoveButtonEiff");
-  ResizeButtonFn = (void (*)(void *, int))
-      so_try_find_addr_rx(&game_mod, "_ZN11Touchscreen12ResizeButtonEi");
 
   debugPrintf("hooks: Linux platform only; version-sensitive gameplay offsets disabled\n");
 }
