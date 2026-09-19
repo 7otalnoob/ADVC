@@ -120,6 +120,7 @@ static const HudWidgetName g_hud_widget_names[] = {
   (sizeof(g_hud_widget_names) / sizeof(g_hud_widget_names[0]))
 
 static int g_adjustable_cfg_done;
+static unsigned g_adjustable_cfg_ready_frames;
 
 void apply_adjustable_cfg(void) {
   if (g_adjustable_cfg_done || !g_touchscreen_slot)
@@ -127,6 +128,13 @@ void apply_adjustable_cfg(void) {
   void *touchscreen = *g_touchscreen_slot;
   if (!touchscreen)
     return; // Touchscreen singleton not constructed yet; retry next frame
+
+  // Give the game a couple of seconds after GTouchscreen first appears to
+  // finish constructing EVERY widget slot, not just the first one -- moving
+  // a not-yet-built widget silently does nothing, which looked like "only
+  // the radar moves" even though the ids themselves are correct.
+  if (g_adjustable_cfg_ready_frames++ < 120)
+    return;
   g_adjustable_cfg_done = 1; // only ever try once, whether the file exists or not
 
   FILE *cfg = fopen("Adjustable.cfg", "r");
