@@ -117,11 +117,57 @@ static const HudProbePoint g_hud_probe_points[] = {
 
 static void **g_touchscreen_slot; // address of the GTouchscreen global (a pointer var)
 static intptr_t (*GetHUDElementAt)(void *self, float x, float y);
+static intptr_t (*GetButtonAt)(void *self, float x, float y);
 static void (*MoveButton)(void *self, int id, float x, float y);
 static void (*ResizeButtonFn)(void *self, int id);
 static intptr_t g_hud_last_id[HUD_PROBE_COUNT]; // -1 = never probed yet
 static int g_hud_probe_pass;
 static unsigned g_hud_probe_frame_count;
+static int g_hud_sweep_done;
+
+// Read-only full-screen sweep: unlike the 43 known button positions, this
+// walks a fine grid across the whole virtual screen (0..690 x 0..435, 15px
+// steps) calling GetHUDElementAt AND GetButtonAt at each point. Pure queries,
+// nothing written anywhere -- safe even if health/money/weapon/timer turn out
+// to live at ids or positions our 43-record table never covered. Logs the
+// first coordinate where each distinct id shows up, once per id.
+#define HUD_SWEEP_MAX_IDS 128
+static void sweep_hud_elements(void *touchscreen) {
+  if (g_hud_sweep_done)
+    return;
+  int seen_hud[HUD_SWEEP_MAX_IDS] = {0};
+  int seen_btn[HUD_SWEEP_MAX_IDS] = {0};
+  FILE *f = fopen("hud_probe.log", "a");
+  if (f)
+    fprintf(f, "--- full-screen sweep (15px grid, 0..690 x 0..435) ---\n");
+  for (float y = 0.0f; y <= 435.0f; y += 15.0f) {
+    for (float x = 0.0f; x <= 690.0f; x += 15.0f) {
+      if (GetHUDElementAt) {
+        intptr_t id = GetHUDElementAt(touchscreen, x, y);
+        if (id >= 0 && id < HUD_SWEEP_MAX_IDS && !seen_hud[id]) {
+          seen_hud[id] = 1;
+          if (f)
+            fprintf(f, "sweep: GetHUDElementAt first hit id=%ld at (x=%.0f y=%.0f)\n",
+                    (long)id, x, y);
+        }
+      }
+      if (GetButtonAt) {
+        intptr_t id = GetButtonAt(touchscreen, x, y);
+        if (id >= 0 && id < HUD_SWEEP_MAX_IDS && !seen_btn[id]) {
+          seen_btn[id] = 1;
+          if (f)
+            fprintf(f, "sweep: GetButtonAt      first hit id=%ld at (x=%.0f y=%.0f)\n",
+                    (long)id, x, y);
+        }
+      }
+    }
+  }
+  if (f) {
+    fflush(f);
+    fclose(f);
+  }
+  g_hud_sweep_done = 1;
+}
 static int g_hud_id_test_done;
 
 // One-shot, opt-in (config.hud_id_test): force-move EVERY widget id we know
@@ -168,6 +214,7 @@ void dump_hud_widget_ids(void) {
   if (!touchscreen)
     return; // Touchscreen singleton not constructed yet; retry later
 
+  sweep_hud_elements(touchscreen);
   run_hud_id_test(touchscreen);
 
   // Re-probe roughly every 3 seconds (assuming ~60 fps) for as long as the
@@ -236,6 +283,8 @@ void patch_game(void) {
   g_touchscreen_slot = (void **)so_try_find_addr_rx(&game_mod, "GTouchscreen");
   GetHUDElementAt = (intptr_t (*)(void *, float, float))
       so_try_find_addr_rx(&game_mod, "_ZN11Touchscreen15GetHUDElementAtEff");
+  GetButtonAt = (intptr_t (*)(void *, float, float))
+      so_try_find_addr_rx(&game_mod, "_ZN11Touchscreen11GetButtonAtEff");
   MoveButton = (void (*)(void *, int, float, float))
       so_try_find_addr_rx(&game_mod, "_ZN11Touchscreen10MoveButtonEiff");
   ResizeButtonFn = (void (*)(void *, int))
