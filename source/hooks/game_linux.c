@@ -124,23 +124,33 @@ static int g_hud_probe_pass;
 static unsigned g_hud_probe_frame_count;
 static int g_hud_id_test_done;
 
-// One-shot, opt-in (config.hud_id_test): force-move the two widget IDs we
-// already confirmed exist (22 and 23) to obvious, far-apart debug spots and
-// resize them, so you can SEE on screen which real HUD element each ID is,
-// instead of guessing from coordinates. Real function calls by symbol only.
+// One-shot, opt-in (config.hud_id_test): force-move EVERY widget id we know
+// about (0..HUD_PROBE_COUNT-1, since MoveButton/ResizeButton directly index
+// an array rather than depending on touch hit-testing) into a readable grid,
+// so every HUD element becomes visible and identifiable at once -- confirmed
+// working already for id 22 (the radar). Real function calls by symbol only,
+// nothing byte-patched.
 static void run_hud_id_test(void *touchscreen) {
   if (g_hud_id_test_done || !config.hud_id_test)
     return;
   FILE *f = fopen("hud_probe.log", "a");
   if (f)
-    fprintf(f, "--- hud_id_test: moving id 22 -> (300,200), id 23 -> (300,260) ---\n");
-  if (MoveButton) {
-    MoveButton(touchscreen, 22, 300.0f, 200.0f);
-    MoveButton(touchscreen, 23, 300.0f, 260.0f);
-  }
-  if (ResizeButtonFn) {
-    ResizeButtonFn(touchscreen, 22);
-    ResizeButtonFn(touchscreen, 23);
+    fprintf(f, "--- hud_id_test: grid-placing ids 0..%d (7 cols, 95x60 spacing, "
+                "origin 40,40) ---\n", (int)HUD_PROBE_COUNT - 1);
+
+  const int cols = 7;
+  const float origin_x = 40.0f, origin_y = 40.0f;
+  const float dx = 95.0f, dy = 60.0f;
+
+  for (int id = 0; id < (int)HUD_PROBE_COUNT; id++) {
+    float gx = origin_x + (id % cols) * dx;
+    float gy = origin_y + (id / cols) * dy;
+    if (MoveButton)
+      MoveButton(touchscreen, id, gx, gy);
+    if (ResizeButtonFn)
+      ResizeButtonFn(touchscreen, id);
+    if (f)
+      fprintf(f, "hud_id_test: id %2d -> grid (%.0f,%.0f)\n", id, gx, gy);
   }
   if (f) {
     fprintf(f, "hud_id_test: done (MoveButton=%p ResizeButton=%p)\n",
