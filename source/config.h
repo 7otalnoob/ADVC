@@ -66,6 +66,10 @@ typedef struct {
                              // alone. VC's mobile default feels very fast on a full
                              // analog stick (it was tuned for small touch swipes);
                              // try something like 0.3-0.6 and adjust to taste.
+  int hud_id_test;           // 0 (default) = off. 1 = once at boot, force-move
+                             // Touchscreen widget IDs 22 and 23 to obvious debug
+                             // spots and resize them, to visually confirm which
+                             // on-screen HUD element each ID is. Experimental.
 } Config;
 
 extern Config config;

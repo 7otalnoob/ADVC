@@ -117,9 +117,39 @@ static const HudProbePoint g_hud_probe_points[] = {
 
 static void **g_touchscreen_slot; // address of the GTouchscreen global (a pointer var)
 static intptr_t (*GetHUDElementAt)(void *self, float x, float y);
+static void (*MoveButton)(void *self, int id, float x, float y);
+static void (*ResizeButtonFn)(void *self, int id);
 static intptr_t g_hud_last_id[HUD_PROBE_COUNT]; // -1 = never probed yet
 static int g_hud_probe_pass;
 static unsigned g_hud_probe_frame_count;
+static int g_hud_id_test_done;
+
+// One-shot, opt-in (config.hud_id_test): force-move the two widget IDs we
+// already confirmed exist (22 and 23) to obvious, far-apart debug spots and
+// resize them, so you can SEE on screen which real HUD element each ID is,
+// instead of guessing from coordinates. Real function calls by symbol only.
+static void run_hud_id_test(void *touchscreen) {
+  if (g_hud_id_test_done || !config.hud_id_test)
+    return;
+  FILE *f = fopen("hud_probe.log", "a");
+  if (f)
+    fprintf(f, "--- hud_id_test: moving id 22 -> (300,200), id 23 -> (300,260) ---\n");
+  if (MoveButton) {
+    MoveButton(touchscreen, 22, 300.0f, 200.0f);
+    MoveButton(touchscreen, 23, 300.0f, 260.0f);
+  }
+  if (ResizeButtonFn) {
+    ResizeButtonFn(touchscreen, 22);
+    ResizeButtonFn(touchscreen, 23);
+  }
+  if (f) {
+    fprintf(f, "hud_id_test: done (MoveButton=%p ResizeButton=%p)\n",
+            (void *)MoveButton, (void *)ResizeButtonFn);
+    fflush(f);
+    fclose(f);
+  }
+  g_hud_id_test_done = 1;
+}
 
 void dump_hud_widget_ids(void) {
   if (!g_touchscreen_slot || !GetHUDElementAt)
@@ -127,6 +157,8 @@ void dump_hud_widget_ids(void) {
   void *touchscreen = *g_touchscreen_slot;
   if (!touchscreen)
     return; // Touchscreen singleton not constructed yet; retry later
+
+  run_hud_id_test(touchscreen);
 
   // Re-probe roughly every 3 seconds (assuming ~60 fps) for as long as the
   // game runs, so playing normally for a bit -- getting in a car, taking out
@@ -194,6 +226,10 @@ void patch_game(void) {
   g_touchscreen_slot = (void **)so_try_find_addr_rx(&game_mod, "GTouchscreen");
   GetHUDElementAt = (intptr_t (*)(void *, float, float))
       so_try_find_addr_rx(&game_mod, "_ZN11Touchscreen15GetHUDElementAtEff");
+  MoveButton = (void (*)(void *, int, float, float))
+      so_try_find_addr_rx(&game_mod, "_ZN11Touchscreen10MoveButtonEiff");
+  ResizeButtonFn = (void (*)(void *, int))
+      so_try_find_addr_rx(&game_mod, "_ZN11Touchscreen12ResizeButtonEi");
 
   debugPrintf("hooks: Linux platform only; version-sensitive gameplay offsets disabled\n");
 }
