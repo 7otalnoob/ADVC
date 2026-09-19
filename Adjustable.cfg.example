@@ -1,0 +1,14 @@
+# Adjustable.cfg -- posiciones del HUD de gtavc_linux
+# Una linea por widget: nombre  x  y  [veces_a_redimensionar]
+# - x,y son coordenadas en el espacio virtual del juego (~0-690 x 0-435)
+# - "veces_a_redimensionar" es opcional (por defecto 0 = no tocar el tamano);
+#   cada llamada activa Touchscreen::ResizeButton, que puede ciclar entre
+#   tamanos preestablecidos -- prueba con 1 y ve subiendo si quieres mas grande.
+#
+# Copia este archivo como "Adjustable.cfg" (sin el .example) en la carpeta
+# del juego para que se aplique al arrancar. Si no existe, no cambia nada.
+#
+# Posiciones de fabrica (confirmadas por sondeo):
+radar 15 15 0
+notifications 585 15 0
+info_panel 90 15 0

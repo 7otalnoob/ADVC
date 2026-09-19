@@ -288,6 +288,7 @@ int main(void) {
     if (config.fps_cap_30)
       keep_game_frame_limiter_off();
     apply_look_sensitivity();
+    apply_adjustable_cfg();
     if ((frames % 60) == 0)
       debugPrintf("main: implOnDrawFrame returned (%lu)\n", frames);
     frames++;
