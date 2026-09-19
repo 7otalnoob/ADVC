@@ -30,7 +30,8 @@
   CONFIG_VAR_INT(mobile_widgets); \
   CONFIG_VAR_INT(fuzzy_seek); \
   CONFIG_VAR_FLOAT(look_sensitivity); \
-  CONFIG_VAR_INT(hud_id_test);
+  CONFIG_VAR_INT(hud_id_test); \
+  CONFIG_VAR_INT(hud_restore_defaults);
 
 Config config;
 
@@ -69,6 +70,7 @@ int read_config(const char *file) {
   config.fuzzy_seek = 1;            // on by default (skip useless mpg123 data on seek)
   config.look_sensitivity = 0.2f;   // <= 0 = don't touch the game's own value
   config.hud_id_test = 0;           // experimental HUD-id probe, off by default
+  config.hud_restore_defaults = 0;  // experimental HUD reset, off by default
 
   FILE *f = fopen(file, "r");
   if (f == NULL)

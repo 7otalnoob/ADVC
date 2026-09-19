@@ -70,6 +70,10 @@ typedef struct {
                              // Touchscreen widget IDs 22 and 23 to obvious debug
                              // spots and resize them, to visually confirm which
                              // on-screen HUD element each ID is. Experimental.
+  int hud_restore_defaults; // 0 (default) = off. 1 = once at boot, call
+                             // Touchscreen::RestoreDefaults() before anything
+                             // else, undoing any earlier hud_id_test moves that
+                             // got saved. Experimental, turn back off after use.
 } Config;
 
 extern Config config;

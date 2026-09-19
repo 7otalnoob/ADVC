@@ -120,6 +120,8 @@ static intptr_t (*GetHUDElementAt)(void *self, float x, float y);
 static intptr_t (*GetButtonAt)(void *self, float x, float y);
 static void (*MoveButton)(void *self, int id, float x, float y);
 static void (*ResizeButtonFn)(void *self, int id);
+static void (*RestoreDefaultsFn)(void *self);
+static int g_hud_restore_done;
 static intptr_t g_hud_last_id[HUD_PROBE_COUNT]; // -1 = never probed yet
 static int g_hud_probe_pass;
 static unsigned g_hud_probe_frame_count;
@@ -214,6 +216,16 @@ void dump_hud_widget_ids(void) {
   if (!touchscreen)
     return; // Touchscreen singleton not constructed yet; retry later
 
+  if (config.hud_restore_defaults && !g_hud_restore_done && RestoreDefaultsFn) {
+    RestoreDefaultsFn(touchscreen);
+    FILE *rf = fopen("hud_probe.log", "a");
+    if (rf) {
+      fprintf(rf, "--- hud_restore_defaults: called Touchscreen::RestoreDefaults() ---\n");
+      fclose(rf);
+    }
+    g_hud_restore_done = 1;
+  }
+
   sweep_hud_elements(touchscreen);
   run_hud_id_test(touchscreen);
 
@@ -289,6 +301,8 @@ void patch_game(void) {
       so_try_find_addr_rx(&game_mod, "_ZN11Touchscreen10MoveButtonEiff");
   ResizeButtonFn = (void (*)(void *, int))
       so_try_find_addr_rx(&game_mod, "_ZN11Touchscreen12ResizeButtonEi");
+  RestoreDefaultsFn = (void (*)(void *))
+      so_try_find_addr_rx(&game_mod, "_ZN11Touchscreen15RestoreDefaultsEv");
 
   debugPrintf("hooks: Linux platform only; version-sensitive gameplay offsets disabled\n");
 }
